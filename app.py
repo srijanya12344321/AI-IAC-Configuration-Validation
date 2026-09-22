@@ -279,27 +279,47 @@ def parse_checkov_results(data):
         )
 
     return results
-
-
 def run_checkov(code, filename="main.tf"):
-    suffix = ".tf"
-
-    if filename.lower().endswith(".tf"):
-        suffix = ".tf"
-
     temp_path = None
+    output_dir = None
 
     try:
         with tempfile.NamedTemporaryFile(
             mode="w",
-            suffix=suffix,
+            suffix=".tf",
             delete=False,
             encoding="utf-8"
         ) as temp_file:
             temp_file.write(code)
             temp_path = temp_file.name
 
-        command = get_checkov_command(temp_path)
+        output_dir = tempfile.mkdtemp(prefix="checkov_output_")
+
+        command = [
+            sys.executable,
+            "-m",
+            "checkov",
+            "-f",
+            temp_path,
+            "--framework",
+            "terraform",
+            "--output",
+            "json",
+            "--output-file-path",
+            output_dir
+        ]
+
+        if st.session_state.settings_check.strip():
+            command.extend([
+                "--check",
+                st.session_state.settings_check.strip()
+            ])
+
+        if st.session_state.settings_skip.strip():
+            command.extend([
+                "--skip-check",
+                st.session_state.settings_skip.strip()
+            ])
 
         process = subprocess.run(
             command,
@@ -308,15 +328,36 @@ def run_checkov(code, filename="main.tf"):
             timeout=180
         )
 
-        combined = process.stdout
+        json_file = os.path.join(
+            output_dir,
+            "results_json.json"
+        )
 
-        if process.stderr:
-            combined += "\n" + process.stderr
+        if not os.path.exists(json_file):
+            json_files = [
+                name
+                for name in os.listdir(output_dir)
+                if name.endswith(".json")
+            ]
 
-        data = extract_json(process.stdout)
+            if json_files:
+                json_file = os.path.join(
+                    output_dir,
+                    json_files[0]
+                )
+
+        data = None
+
+        if os.path.exists(json_file):
+            with open(
+                json_file,
+                "r",
+                encoding="utf-8"
+            ) as result_file:
+                data = json.load(result_file)
 
         if data is None:
-            data = extract_json(combined)
+            data = extract_json(process.stdout)
 
         if data is None:
             return {
@@ -325,8 +366,11 @@ def run_checkov(code, filename="main.tf"):
                 "passed": 0,
                 "failed": 0,
                 "skipped": 0,
-                "raw": combined,
-                "error": "Checkov did not return readable JSON output."
+                "raw": process.stdout,
+                "error": (
+                    "Checkov did not produce a readable JSON result. "
+                    + process.stderr[-2000:]
+                )
             }
 
         findings = parse_checkov_results(data)
@@ -381,6 +425,12 @@ def run_checkov(code, filename="main.tf"):
         if temp_path and os.path.exists(temp_path):
             try:
                 os.remove(temp_path)
+            except Exception:
+                pass
+
+        if output_dir and os.path.exists(output_dir):
+            try:
+                shutil.rmtree(output_dir)
             except Exception:
                 pass
 
