@@ -2,7 +2,6 @@ import os
 import sys
 import json
 import csv
-import difflib
 import shutil
 import tempfile
 import subprocess
@@ -12,10 +11,6 @@ import pandas as pd
 import streamlit as st
 
 
-# ============================================================
-# PAGE CONFIGURATION
-# ============================================================
-
 st.set_page_config(
     page_title="AI-IAC Validator",
     page_icon="🔎",
@@ -23,10 +18,6 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-
-# ============================================================
-# CUSTOM CSS
-# ============================================================
 
 st.markdown(
     """
@@ -66,26 +57,11 @@ st.markdown(
         color: #174a9c;
         font-weight: 600;
     }
-
-    .metric-card {
-        padding: 15px;
-        border-radius: 10px;
-        border: 1px solid #ddd;
-        background: #fafafa;
-    }
-
-    div[data-testid="stMetric"] {
-        border-radius: 10px;
-    }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-
-# ============================================================
-# DEMO TERRAFORM CONFIGURATIONS
-# ============================================================
 
 UNSAFE_DEMO = """terraform {
   required_providers {
@@ -155,10 +131,6 @@ resource "aws_security_group" "demo" {
 """
 
 
-# ============================================================
-# SESSION STATE
-# ============================================================
-
 def initialize_state():
     defaults = {
         "terraform_code": SAFE_DEMO,
@@ -173,7 +145,14 @@ def initialize_state():
         "settings_check": "",
         "settings_skip": "",
         "selected_finding": None,
-        "plan_json": "",
+        "cvs_output": "",
+        "cvs_repository": "",
+        "cvs_module": "",
+        "cvs_username": "",
+        "cvs_password": "",
+        "cvs_root": "",
+        "cvs_workspace": "",
+        "cvs_ready": False,
     }
 
     for key, value in defaults.items():
@@ -183,10 +162,6 @@ def initialize_state():
 
 initialize_state()
 
-
-# ============================================================
-# HELPER FUNCTIONS
-# ============================================================
 
 def add_audit(action, details=""):
     st.session_state.audit_log.append(
@@ -208,52 +183,92 @@ def add_history(message):
     )
 
 
-def get_checkov_path():
-    """
-    Find the Checkov executable installed by pip/Streamlit.
-    """
-    checkov_path = shutil.which("checkov")
+def get_executable(name):
+    path = shutil.which(name)
 
-    if checkov_path:
-        return checkov_path
+    if path:
+        return path
 
-    # Sometimes executables are installed beside the Python executable.
     python_dir = os.path.dirname(sys.executable)
 
-    possible_paths = [
-        os.path.join(python_dir, "checkov"),
-        os.path.join(python_dir, "checkov.exe"),
+    possible = [
+        os.path.join(python_dir, name),
+        os.path.join(python_dir, name + ".exe"),
     ]
 
-    for path in possible_paths:
-        if os.path.exists(path):
-            return path
+    for item in possible:
+        if os.path.exists(item):
+            return item
 
     return None
 
 
+def get_checkov_path():
+    return get_executable("checkov")
+
+
+def get_cvs_path():
+    return get_executable("cvs")
+
+
+def run_command(command, cwd=None, timeout=120, env=None):
+    try:
+        process = subprocess.run(
+            command,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+        )
+
+        return {
+            "returncode": process.returncode,
+            "stdout": process.stdout or "",
+            "stderr": process.stderr or "",
+            "error": "",
+        }
+
+    except FileNotFoundError:
+        return {
+            "returncode": -1,
+            "stdout": "",
+            "stderr": "",
+            "error": f"Command not found: {command[0]}",
+        }
+
+    except subprocess.TimeoutExpired:
+        return {
+            "returncode": -1,
+            "stdout": "",
+            "stderr": "",
+            "error": "Command timed out.",
+        }
+
+    except Exception as exc:
+        return {
+            "returncode": -1,
+            "stdout": "",
+            "stderr": "",
+            "error": str(exc),
+        }
+
+
 def extract_json(text):
-    """
-    Try to extract a JSON object from command output.
-    """
     if not text:
         return None
 
-    text = text.strip()
-
     try:
-        return json.loads(text)
+        return json.loads(text.strip())
     except Exception:
         pass
 
     start = text.find("{")
     end = text.rfind("}")
 
-    if start != -1 and end != -1 and end > start:
-        candidate = text[start:end + 1]
-
+    if start != -1 and end != -1:
         try:
-            return json.loads(candidate)
+            return json.loads(text[start:end + 1])
         except Exception:
             pass
 
@@ -261,10 +276,6 @@ def extract_json(text):
 
 
 def parse_checkov_results(data):
-    """
-    Convert Checkov's JSON result into a simpler structure for the UI.
-    """
-
     findings = []
 
     results = data.get("results", {})
@@ -273,151 +284,64 @@ def parse_checkov_results(data):
     passed_checks = results.get("passed_checks", [])
     skipped_checks = results.get("skipped_checks", [])
 
-    for item in failed_checks:
-        findings.append(
-            {
-                "status": "FAILED",
-                "check_id": item.get("check_id", "Unknown"),
-                "check_name": item.get(
-                    "check_name",
-                    item.get("check", "Unknown check")
-                ),
-                "severity": item.get("severity", "UNKNOWN"),
-                "resource": item.get(
-                    "resource",
-                    item.get("resource_address", "Unknown")
-                ),
-                "file_path": item.get("file_path", ""),
-                "file_line_range": item.get(
-                    "file_line_range",
-                    ""
-                ),
-                "guideline": item.get("guideline", ""),
-                "code_block": item.get("code_block", []),
-            }
-        )
-
-    for item in passed_checks:
-        findings.append(
-            {
-                "status": "PASSED",
-                "check_id": item.get("check_id", "Unknown"),
-                "check_name": item.get(
-                    "check_name",
-                    item.get("check", "Unknown check")
-                ),
-                "severity": item.get("severity", "UNKNOWN"),
-                "resource": item.get(
-                    "resource",
-                    item.get("resource_address", "Unknown")
-                ),
-                "file_path": item.get("file_path", ""),
-                "file_line_range": item.get(
-                    "file_line_range",
-                    ""
-                ),
-                "guideline": item.get("guideline", ""),
-                "code_block": item.get("code_block", []),
-            }
-        )
-
-    for item in skipped_checks:
-        findings.append(
-            {
-                "status": "SKIPPED",
-                "check_id": item.get("check_id", "Unknown"),
-                "check_name": item.get(
-                    "check_name",
-                    item.get("check", "Unknown check")
-                ),
-                "severity": item.get("severity", "UNKNOWN"),
-                "resource": item.get(
-                    "resource",
-                    item.get("resource_address", "Unknown")
-                ),
-                "file_path": item.get("file_path", ""),
-                "file_line_range": item.get(
-                    "file_line_range",
-                    ""
-                ),
-                "guideline": item.get("guideline", ""),
-                "code_block": item.get("code_block", []),
-            }
-        )
+    for status, items in [
+        ("FAILED", failed_checks),
+        ("PASSED", passed_checks),
+        ("SKIPPED", skipped_checks),
+    ]:
+        for item in items:
+            findings.append(
+                {
+                    "status": status,
+                    "check_id": item.get("check_id", "Unknown"),
+                    "check_name": item.get(
+                        "check_name",
+                        item.get("check", "Unknown check"),
+                    ),
+                    "severity": item.get("severity", "UNKNOWN"),
+                    "resource": item.get(
+                        "resource",
+                        item.get("resource_address", "Unknown"),
+                    ),
+                    "file_path": item.get("file_path", ""),
+                    "file_line_range": item.get(
+                        "file_line_range",
+                        "",
+                    ),
+                    "guideline": item.get("guideline", ""),
+                    "code_block": item.get("code_block", []),
+                }
+            )
 
     return findings
 
 
-# ============================================================
-# CORRECTED CHECKOV FUNCTION
-# ============================================================
-
 def run_checkov(code, filename="main.tf"):
-    """
-    Run the installed Checkov CLI against a temporary Terraform file.
+    checkov_path = get_checkov_path()
 
-    Important:
-    We intentionally DO NOT use:
+    if not checkov_path:
+        return {
+            "status": "ERROR",
+            "findings": [],
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "raw": "",
+            "error": (
+                "Checkov was not found. Install it with "
+                "'pip install checkov'."
+            ),
+        }
 
-        python -m checkov
-
-    because the deployed Checkov package may not expose checkov.main
-    as a runnable Python module.
-
-    Instead we execute the installed `checkov` command directly.
-    """
-
-    temp_path = None
-    output_dir = None
+    temp_dir = tempfile.mkdtemp(prefix="iac_check_")
+    temp_path = os.path.join(temp_dir, filename)
 
     try:
+        with open(temp_path, "w", encoding="utf-8") as file:
+            file.write(code)
 
-        # --------------------------------------------------------
-        # Check whether Checkov is installed
-        # --------------------------------------------------------
-
-        checkov_path = get_checkov_path()
-
-        if not checkov_path:
-            return {
-                "status": "ERROR",
-                "findings": [],
-                "passed": 0,
-                "failed": 0,
-                "skipped": 0,
-                "raw": "",
-                "error": (
-                    "Checkov executable was not found. "
-                    "Make sure 'checkov' is present in requirements.txt "
-                    "and wait for Streamlit to finish reinstalling dependencies."
-                ),
-            }
-
-        # --------------------------------------------------------
-        # Create temporary Terraform file
-        # --------------------------------------------------------
-
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            suffix=".tf",
-            delete=False,
-            encoding="utf-8",
-        ) as temp_file:
-
-            temp_file.write(code)
-            temp_path = temp_file.name
-
-        # --------------------------------------------------------
-        # Temporary directory for Checkov JSON output
-        # --------------------------------------------------------
-
-        output_dir = tempfile.mkdtemp(
-            prefix="checkov_output_"
-        )
-
-        # --------------------------------------------------------
-        # Build Checkov command
-        # --------------------------------------------------------
+        output_dir = os.path.join(temp_dir, "checkov_output")
+        os.makedirs(output_dir, exist_ok=True)
 
         command = [
             checkov_path,
@@ -431,7 +355,6 @@ def run_checkov(code, filename="main.tf"):
             output_dir,
         ]
 
-        # Optional selected checks
         if st.session_state.settings_check.strip():
             command.extend(
                 [
@@ -440,8 +363,6 @@ def run_checkov(code, filename="main.tf"):
                 ]
             )
 
-        # IMPORTANT:
-        # Checkov uses --skip-check, NOT --skip
         if st.session_state.settings_skip.strip():
             command.extend(
                 [
@@ -450,167 +371,70 @@ def run_checkov(code, filename="main.tf"):
                 ]
             )
 
-        # --------------------------------------------------------
-        # Run Checkov
-        # --------------------------------------------------------
-
-        process = subprocess.run(
+        result = run_command(
             command,
-            capture_output=True,
-            text=True,
             timeout=180,
         )
 
-        stdout = process.stdout or ""
-        stderr = process.stderr or ""
-
-        # --------------------------------------------------------
-        # Locate JSON output
-        # --------------------------------------------------------
-
         data = None
 
-        if os.path.exists(output_dir):
+        for root, _, files in os.walk(output_dir):
+            for name in files:
+                if name.lower().endswith(".json"):
+                    path = os.path.join(root, name)
 
-            json_files = []
+                    try:
+                        with open(
+                            path,
+                            "r",
+                            encoding="utf-8",
+                        ) as file:
+                            candidate = json.load(file)
 
-            for root, dirs, files in os.walk(output_dir):
-                for name in files:
-                    if name.lower().endswith(".json"):
-                        json_files.append(
-                            os.path.join(root, name)
-                        )
-
-            # Try every JSON file until a valid Checkov result
-            # is found.
-            for json_path in json_files:
-
-                try:
-                    with open(
-                        json_path,
-                        "r",
-                        encoding="utf-8",
-                    ) as result_file:
-
-                        candidate = json.load(result_file)
-
-                    if isinstance(candidate, dict):
-
-                        if "results" in candidate:
+                        if isinstance(candidate, dict):
                             data = candidate
                             break
 
-                        if data is None:
-                            data = candidate
+                    except Exception:
+                        continue
 
-                except Exception:
-                    continue
-
-        # --------------------------------------------------------
-        # Fallback: JSON printed directly to stdout
-        # --------------------------------------------------------
+            if data:
+                break
 
         if data is None:
-            data = extract_json(stdout)
-
-        # --------------------------------------------------------
-        # If JSON still cannot be found
-        # --------------------------------------------------------
+            data = extract_json(result["stdout"])
 
         if data is None:
-
-            error_message = (
-                "Checkov did not produce a readable JSON result."
-            )
-
-            if stderr.strip():
-                error_message += (
-                    "\n\nCheckov message:\n"
-                    + stderr[-4000:]
-                )
-
-            if stdout.strip():
-                error_message += (
-                    "\n\nCheckov output:\n"
-                    + stdout[-4000:]
-                )
-
             return {
                 "status": "ERROR",
                 "findings": [],
                 "passed": 0,
                 "failed": 0,
                 "skipped": 0,
-                "raw": stdout,
-                "error": error_message,
+                "raw": result["stdout"],
+                "error": (
+                    "Checkov did not produce readable JSON.\n\n"
+                    + result["stderr"]
+                ),
             }
-
-        # --------------------------------------------------------
-        # Parse results
-        # --------------------------------------------------------
 
         results = data.get("results", {})
 
-        failed_checks = results.get(
-            "failed_checks",
-            []
-        )
-
-        passed_checks = results.get(
-            "passed_checks",
-            []
-        )
-
-        skipped_checks = results.get(
-            "skipped_checks",
-            []
-        )
-
-        findings = parse_checkov_results(data)
-
-        failed_count = len(failed_checks)
-        passed_count = len(passed_checks)
-        skipped_count = len(skipped_checks)
-
-        # IMPORTANT:
-        # Checkov normally returns a non-zero exit code when
-        # security checks fail.
-        #
-        # That is NOT an application error.
-        #
-        # If JSON was successfully parsed, we use the actual
-        # findings to determine PASS/FAIL.
-
-        status = (
-            "FAILED"
-            if failed_count > 0
-            else "PASSED"
-        )
+        failed = results.get("failed_checks", [])
+        passed = results.get("passed_checks", [])
+        skipped = results.get("skipped_checks", [])
 
         return {
-            "status": status,
-            "findings": findings,
-            "passed": passed_count,
-            "failed": failed_count,
-            "skipped": skipped_count,
+            "status": "FAILED" if failed else "PASSED",
+            "findings": parse_checkov_results(data),
+            "passed": len(passed),
+            "failed": len(failed),
+            "skipped": len(skipped),
             "raw": data,
             "error": "",
         }
 
-    except subprocess.TimeoutExpired:
-
-        return {
-            "status": "ERROR",
-            "findings": [],
-            "passed": 0,
-            "failed": 0,
-            "skipped": 0,
-            "raw": "",
-            "error": "Checkov validation timed out after 180 seconds.",
-        }
-
     except Exception as exc:
-
         return {
             "status": "ERROR",
             "findings": [],
@@ -622,61 +446,32 @@ def run_checkov(code, filename="main.tf"):
         }
 
     finally:
+        shutil.rmtree(
+            temp_dir,
+            ignore_errors=True,
+        )
 
-        if temp_path and os.path.exists(temp_path):
-
-            try:
-                os.remove(temp_path)
-            except Exception:
-                pass
-
-        if output_dir and os.path.exists(output_dir):
-
-            try:
-                shutil.rmtree(output_dir)
-            except Exception:
-                pass
-
-
-# ============================================================
-# AI EXPLANATION
-# ============================================================
 
 def get_ai_explanation(finding):
-    """
-    Optional OpenAI explanation.
+    check_id = finding.get(
+        "check_id",
+        "Unknown",
+    )
 
-    If no API key is configured, use the built-in explanation
-    so the application still works.
-    """
-
-    check_id = finding.get("check_id", "Unknown")
     check_name = finding.get(
         "check_name",
         "Security configuration issue",
     )
+
     resource = finding.get(
         "resource",
         "Unknown resource",
     )
+
     guideline = finding.get(
         "guideline",
         "",
     )
-
-    api_key = None
-
-    try:
-        api_key = st.secrets.get(
-            "OPENAI_API_KEY",
-            None,
-        )
-    except Exception:
-        api_key = None
-
-    # --------------------------------------------------------
-    # Built-in explanation
-    # --------------------------------------------------------
 
     fallback = f"""
 ### Security Finding
@@ -689,76 +484,65 @@ def get_ai_explanation(finding):
 
 ### Why this matters
 
-This Checkov policy identified a configuration that may increase
-the security exposure of the infrastructure.
-
-The configuration should be reviewed and restricted according
-to the application's actual networking and access requirements.
+The Checkov policy identified a configuration
+that may violate a security requirement.
 
 ### Recommended approach
 
-1. Identify the resource producing the finding.
-2. Review the network or permission configuration.
-3. Restrict access to only the required sources.
-4. Run Checkov again after making the correction.
+Review the affected Terraform resource,
+restrict unnecessary access, and run the
+validation again.
 
 ### Checkov guidance
 
-{guideline if guideline else "Review the Checkov policy documentation for this check."}
+{guideline if guideline else "Review the applicable Checkov policy guidance."}
 """
+
+    api_key = None
+
+    try:
+        api_key = st.secrets.get(
+            "OPENAI_API_KEY",
+            None,
+        )
+    except Exception:
+        pass
 
     if not api_key:
         return fallback
 
-    # --------------------------------------------------------
-    # Optional OpenAI integration
-    # --------------------------------------------------------
-
     try:
-
         from openai import OpenAI
 
         client = OpenAI(
-            api_key=api_key
+            api_key=api_key,
         )
-
-        model = os.getenv(
-            "OPENAI_MODEL",
-            "gpt-4o-mini",
-        )
-
-        prompt = f"""
-You are assisting with Terraform infrastructure security.
-
-Explain this Checkov finding to a college student.
-
-Check ID:
-{check_id}
-
-Check name:
-{check_name}
-
-Resource:
-{resource}
-
-Guideline:
-{guideline}
-
-Give:
-1. What the problem means
-2. Why it matters
-3. What should be changed
-4. How to validate the correction
-
-Do not invent information that is not present in the finding.
-"""
 
         response = client.chat.completions.create(
-            model=model,
+            model=os.getenv(
+                "OPENAI_MODEL",
+                "gpt-4o-mini",
+            ),
             messages=[
                 {
                     "role": "user",
-                    "content": prompt,
+                    "content": f"""
+Explain this Checkov Terraform security finding
+to a college student.
+
+Check ID: {check_id}
+Check name: {check_name}
+Resource: {resource}
+Guideline: {guideline}
+
+Explain:
+1. What the problem means.
+2. Why it matters.
+3. What should be changed.
+4. How to revalidate it.
+
+Do not invent facts.
+""",
                 }
             ],
             temperature=0.2,
@@ -770,42 +554,12 @@ Do not invent information that is not present in the finding.
         return fallback
 
 
-# ============================================================
-# SUGGESTED CORRECTION
-# ============================================================
-
-def generate_correction(code, findings):
-    """
-    Generate a deterministic demo correction.
-
-    This specifically handles the common demo finding where
-    SSH is exposed to the entire internet.
-    """
-
+def generate_correction(code):
     corrected = code
 
     changed = False
 
-    # Common unsafe SSH rule
-    if (
-        'from_port   = 22' in corrected
-        and 'cidr_blocks = ["0.0.0.0/0"]' in corrected
-    ):
-
-        corrected = corrected.replace(
-            'cidr_blocks = ["0.0.0.0/0"]',
-            'cidr_blocks = ["10.0.0.0/24"]',
-            1,
-        )
-
-        changed = True
-
-    # Alternative spacing
-    if (
-        'from_port = 22' in corrected
-        and 'cidr_blocks = ["0.0.0.0/0"]' in corrected
-    ):
-
+    if 'cidr_blocks = ["0.0.0.0/0"]' in corrected:
         corrected = corrected.replace(
             'cidr_blocks = ["0.0.0.0/0"]',
             'cidr_blocks = ["10.0.0.0/24"]',
@@ -817,1432 +571,1074 @@ def generate_correction(code, findings):
     if changed:
         return corrected
 
-    # If no automatic demo correction exists,
-    # return the original code.
-    return corrected
+    return ""
 
 
 # ============================================================
-# DIFF
+# CVS FUNCTIONS
 # ============================================================
 
-def create_diff(old_code, new_code):
-    return "".join(
-        difflib.unified_diff(
-            old_code.splitlines(True),
-            new_code.splitlines(True),
-            fromfile="Before",
-            tofile="After",
-        )
+def cvs_environment():
+    env = os.environ.copy()
+
+    if st.session_state.cvs_root.strip():
+        env["CVSROOT"] = st.session_state.cvs_root.strip()
+
+    return env
+
+
+def cvs_is_available():
+    return get_cvs_path() is not None
+
+
+def cvs_status():
+    cvs_path = get_cvs_path()
+
+    if not cvs_path:
+        return {
+            "ok": False,
+            "message": "CVS executable was not found.",
+        }
+
+    result = run_command(
+        [cvs_path, "--version"],
+        timeout=30,
+        env=cvs_environment(),
     )
 
-
-# ============================================================
-# REPORT GENERATION
-# ============================================================
-
-def create_report_data():
-    result = st.session_state.checkov_result
-
-    if not result:
+    if result["returncode"] != 0:
         return {
-            "generated_at": datetime.now().isoformat(),
-            "filename": st.session_state.filename,
-            "status": "NOT_RUN",
-            "passed": 0,
-            "failed": 0,
-            "skipped": 0,
-            "findings": [],
+            "ok": False,
+            "message": result["stderr"] or result["error"],
         }
 
     return {
-        "generated_at": datetime.now().isoformat(),
-        "filename": st.session_state.filename,
-        "status": result.get("status"),
-        "passed": result.get("passed", 0),
-        "failed": result.get("failed", 0),
-        "skipped": result.get("skipped", 0),
-        "findings": result.get("findings", []),
+        "ok": True,
+        "message": result["stdout"],
     }
 
 
-def report_json():
-    return json.dumps(
-        create_report_data(),
-        indent=2,
-        default=str,
+def cvs_checkout(module, workspace):
+    cvs_path = get_cvs_path()
+
+    if not cvs_path:
+        return {
+            "ok": False,
+            "message": "CVS executable was not found.",
+        }
+
+    os.makedirs(workspace, exist_ok=True)
+
+    command = [
+        cvs_path,
+        "-d",
+        st.session_state.cvs_root.strip(),
+        "checkout",
+        module,
+    ]
+
+    result = run_command(
+        command,
+        cwd=workspace,
+        timeout=120,
+        env=cvs_environment(),
     )
 
+    ok = result["returncode"] == 0
 
-def report_csv():
-    result = st.session_state.checkov_result
+    return {
+        "ok": ok,
+        "message": (
+            result["stdout"]
+            if ok
+            else result["stderr"] or result["error"]
+        ),
+    }
 
-    rows = []
 
-    if result:
+def cvs_update(workspace):
+    cvs_path = get_cvs_path()
 
-        for finding in result.get(
-            "findings",
-            [],
-        ):
+    if not cvs_path:
+        return {
+            "ok": False,
+            "message": "CVS executable was not found.",
+        }
 
-            rows.append(
-                {
-                    "status": finding.get(
-                        "status",
-                        "",
-                    ),
-                    "check_id": finding.get(
-                        "check_id",
-                        "",
-                    ),
-                    "check_name": finding.get(
-                        "check_name",
-                        "",
-                    ),
-                    "severity": finding.get(
-                        "severity",
-                        "",
-                    ),
-                    "resource": finding.get(
-                        "resource",
-                        "",
-                    ),
-                    "file_path": finding.get(
-                        "file_path",
-                        "",
-                    ),
-                }
-            )
+    result = run_command(
+        [cvs_path, "update"],
+        cwd=workspace,
+        timeout=120,
+        env=cvs_environment(),
+    )
 
-    if not rows:
+    return {
+        "ok": result["returncode"] == 0,
+        "message": (
+            result["stdout"]
+            if result["returncode"] == 0
+            else result["stderr"] or result["error"]
+        ),
+    }
 
-        rows.append(
-            {
-                "status": "",
-                "check_id": "",
-                "check_name": "",
-                "severity": "",
-                "resource": "",
-                "file_path": "",
-            }
+
+def cvs_add(workspace, filename):
+    cvs_path = get_cvs_path()
+
+    if not cvs_path:
+        return {
+            "ok": False,
+            "message": "CVS executable was not found.",
+        }
+
+    result = run_command(
+        [
+            cvs_path,
+            "add",
+            filename,
+        ],
+        cwd=workspace,
+        timeout=60,
+        env=cvs_environment(),
+    )
+
+    return {
+        "ok": result["returncode"] == 0,
+        "message": (
+            result["stdout"]
+            if result["returncode"] == 0
+            else result["stderr"] or result["error"]
+        ),
+    }
+
+
+def cvs_diff(workspace, filename):
+    cvs_path = get_cvs_path()
+
+    if not cvs_path:
+        return {
+            "ok": False,
+            "message": "CVS executable was not found.",
+        }
+
+    result = run_command(
+        [
+            cvs_path,
+            "diff",
+            "-u",
+            filename,
+        ],
+        cwd=workspace,
+        timeout=60,
+        env=cvs_environment(),
+    )
+
+    return {
+        "ok": True,
+        "message": result["stdout"] or result["stderr"],
+    }
+
+
+def cvs_commit(workspace, filename, message):
+    cvs_path = get_cvs_path()
+
+    if not cvs_path:
+        return {
+            "ok": False,
+            "message": "CVS executable was not found.",
+        }
+
+    result = run_command(
+        [
+            cvs_path,
+            "commit",
+            "-m",
+            message,
+            filename,
+        ],
+        cwd=workspace,
+        timeout=120,
+        env=cvs_environment(),
+    )
+
+    return {
+        "ok": result["returncode"] == 0,
+        "message": (
+            result["stdout"]
+            if result["returncode"] == 0
+            else result["stderr"] or result["error"]
+        ),
+    }
+
+
+def cvs_log(workspace, filename):
+    cvs_path = get_cvs_path()
+
+    if not cvs_path:
+        return {
+            "ok": False,
+            "message": "CVS executable was not found.",
+        }
+
+    result = run_command(
+        [
+            cvs_path,
+            "log",
+            filename,
+        ],
+        cwd=workspace,
+        timeout=60,
+        env=cvs_environment(),
+    )
+
+    return {
+        "ok": result["returncode"] == 0,
+        "message": (
+            result["stdout"]
+            if result["returncode"] == 0
+            else result["stderr"] or result["error"]
+        ),
+    }
+
+
+def cvs_prepare_workspace():
+    if not st.session_state.cvs_workspace.strip():
+        st.session_state.cvs_workspace = tempfile.mkdtemp(
+            prefix="cvs_workspace_"
         )
 
-    output = []
-
-    fieldnames = list(
-        rows[0].keys()
+    os.makedirs(
+        st.session_state.cvs_workspace,
+        exist_ok=True,
     )
 
-    output.append(
-        ",".join(fieldnames)
+    return st.session_state.cvs_workspace
+
+
+def save_code_to_cvs_workspace():
+    workspace = cvs_prepare_workspace()
+
+    path = os.path.join(
+        workspace,
+        st.session_state.filename,
     )
 
-    for row in rows:
-
-        output.append(
-            ",".join(
-                '"' + str(row[field]).replace('"', '""') + '"'
-                for field in fieldnames
-            )
+    with open(
+        path,
+        "w",
+        encoding="utf-8",
+    ) as file:
+        file.write(
+            st.session_state.terraform_code
         )
 
-    return "\n".join(output)
+    return path
 
 
-def report_html():
-    result = st.session_state.checkov_result
+def cvs_validate_and_commit():
+    if not cvs_is_available():
+        return {
+            "ok": False,
+            "message": (
+                "CVS is not installed on the machine "
+                "running this application."
+            ),
+        }
 
-    status = (
-        result.get("status")
-        if result
-        else "NOT RUN"
+    if not st.session_state.cvs_root.strip():
+        return {
+            "ok": False,
+            "message": (
+                "Enter the CVSROOT in the CVS Settings "
+                "before using CVS."
+            ),
+        }
+
+    if not st.session_state.cvs_module.strip():
+        return {
+            "ok": False,
+            "message": (
+                "Enter the CVS module name in CVS Settings."
+            ),
+        }
+
+    workspace = cvs_prepare_workspace()
+
+    checkout = cvs_checkout(
+        st.session_state.cvs_module.strip(),
+        workspace,
     )
 
-    passed = (
-        result.get("passed", 0)
-        if result
-        else 0
+    if not checkout["ok"]:
+        return checkout
+
+    st.session_state.terraform_code = st.session_state.terraform_code
+
+    path = os.path.join(
+        workspace,
+        st.session_state.filename,
     )
 
-    failed = (
-        result.get("failed", 0)
-        if result
-        else 0
+    with open(
+        path,
+        "w",
+        encoding="utf-8",
+    ) as file:
+        file.write(
+            st.session_state.terraform_code
+        )
+
+    update = cvs_update(workspace)
+
+    if not update["ok"]:
+        return update
+
+    add_result = cvs_add(
+        workspace,
+        st.session_state.filename,
     )
 
-    skipped = (
-        result.get("skipped", 0)
-        if result
-        else 0
+    if not add_result["ok"]:
+        message = add_result["message"].lower()
+
+        if "already" not in message and "cvs/entries" not in message:
+            return add_result
+
+    result = run_checkov(
+        st.session_state.terraform_code,
+        st.session_state.filename,
     )
 
-    rows = ""
+    st.session_state.checkov_result = result
 
-    if result:
+    add_audit(
+        "CVS validation",
+        f"Checkov status: {result['status']}",
+    )
 
-        for finding in result.get(
-            "findings",
-            [],
-        ):
+    if result["status"] != "PASSED":
+        return {
+            "ok": False,
+            "message": (
+                "CVS commit blocked because Checkov "
+                "reported security failures."
+            ),
+            "checkov": result,
+        }
 
-            rows += f"""
-            <tr>
-                <td>{finding.get("status", "")}</td>
-                <td>{finding.get("check_id", "")}</td>
-                <td>{finding.get("check_name", "")}</td>
-                <td>{finding.get("severity", "")}</td>
-                <td>{finding.get("resource", "")}</td>
-            </tr>
-            """
+    commit = cvs_commit(
+        workspace,
+        st.session_state.filename,
+        "Validated IaC security configuration",
+    )
 
-    return f"""
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="UTF-8">
-<title>AI-IAC Validator Report</title>
-<style>
-body {{
-    font-family: Arial, sans-serif;
-    margin: 40px;
-}}
+    if commit["ok"]:
+        add_history(
+            "Checkov validation passed and configuration committed to CVS."
+        )
 
-table {{
-    width: 100%;
-    border-collapse: collapse;
-}}
+        add_audit(
+            "CVS commit",
+            "Successful CVS commit after Checkov validation.",
+        )
 
-th, td {{
-    border: 1px solid #ccc;
-    padding: 8px;
-    text-align: left;
-}}
+    return {
+        "ok": commit["ok"],
+        "message": commit["message"],
+        "checkov": result,
+    }
 
-th {{
-    background: #f2f2f2;
-}}
-</style>
-</head>
 
-<body>
+# ============================================================
+# HEADER
+# ============================================================
 
-<h1>AI-IAC Validator Report</h1>
+st.markdown(
+    '<div class="main-title">🔎 AI-IAC Validator</div>',
+    unsafe_allow_html=True,
+)
 
-<p>
-<b>Generated:</b>
-{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-</p>
-
-<p>
-<b>Terraform file:</b>
-{st.session_state.filename}
-</p>
-
-<h2>Validation Summary</h2>
-
-<p>
-Status: <b>{status}</b>
-</p>
-
-<ul>
-<li>Passed: {passed}</li>
-<li>Failed: {failed}</li>
-<li>Skipped: {skipped}</li>
-</ul>
-
-<h2>Findings</h2>
-
-<table>
-
-<tr>
-<th>Status</th>
-<th>Check ID</th>
-<th>Check Name</th>
-<th>Severity</th>
-<th>Resource</th>
-</tr>
-
-{rows}
-
-</table>
-
-</body>
-</html>
-"""
+st.markdown(
+    """
+    <div class="subtitle">
+    Terraform/IaC security validation using Checkov,
+    CVS version control and optional AI explanations.
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 
 # ============================================================
 # SIDEBAR
 # ============================================================
 
-st.sidebar.title("🔎 AI-IAC Validator")
+with st.sidebar:
 
-pages = [
-    "Dashboard",
-    "IaC Configuration",
-    "Checkov Validation",
-    "Security Findings",
-    "AI Explanation",
-    "Suggested Correction",
-    "Re-validation",
-    "Before/After",
-    "CVS History",
-    "Audit Log",
-    "Analytics",
-    "Reports",
-    "Settings",
-    "Terraform Plan",
-]
+    st.header("⚙️ Configuration")
 
-page = st.sidebar.radio(
-    "Navigation",
-    pages,
+    st.session_state.settings_check = st.text_input(
+        "Checkov checks",
+        value=st.session_state.settings_check,
+        help="Example: CKV_AWS_18,CKV_AWS_19",
+    )
+
+    st.session_state.settings_skip = st.text_input(
+        "Skip Checkov checks",
+        value=st.session_state.settings_skip,
+        help="Example: CKV_AWS_999",
+    )
+
+    st.divider()
+
+    st.header("📦 CVS Settings")
+
+    st.session_state.cvs_root = st.text_input(
+        "CVSROOT",
+        value=st.session_state.cvs_root,
+        placeholder="Example: /path/to/cvs/repository",
+        type="default",
+    )
+
+    st.session_state.cvs_module = st.text_input(
+        "CVS Module",
+        value=st.session_state.cvs_module,
+        placeholder="Example: iac-project",
+    )
+
+    st.session_state.cvs_username = st.text_input(
+        "CVS Username",
+        value=st.session_state.cvs_username,
+    )
+
+    st.session_state.cvs_workspace = st.text_input(
+        "CVS Workspace",
+        value=st.session_state.cvs_workspace,
+        placeholder="Leave empty for temporary workspace",
+    )
+
+    if st.button(
+        "🔍 Check CVS Installation",
+        use_container_width=True,
+    ):
+        status = cvs_status()
+
+        if status["ok"]:
+            st.success("CVS is installed.")
+            st.code(status["message"])
+        else:
+            st.error(status["message"])
+
+    st.divider()
+
+    st.info(
+        "CVS is the version-control system. "
+        "Checkov performs the security validation."
+    )
+
+
+# ============================================================
+# DEMO BUTTONS
+# ============================================================
+
+st.subheader("🎯 Demonstration")
+
+demo_col1, demo_col2 = st.columns(2)
+
+with demo_col1:
+    if st.button(
+        "Load Unsafe Demo",
+        use_container_width=True,
+    ):
+        st.session_state.terraform_code = UNSAFE_DEMO
+        st.session_state.filename = "unsafe_demo.tf"
+        st.session_state.checkov_result = None
+        st.session_state.ai_explanation = ""
+        st.session_state.suggested_code = ""
+        st.rerun()
+
+with demo_col2:
+    if st.button(
+        "Load Safe Demo",
+        use_container_width=True,
+    ):
+        st.session_state.terraform_code = SAFE_DEMO
+        st.session_state.filename = "safe_demo.tf"
+        st.session_state.checkov_result = None
+        st.session_state.ai_explanation = ""
+        st.session_state.suggested_code = ""
+        st.rerun()
+
+
+# ============================================================
+# UPLOAD
+# ============================================================
+
+uploaded = st.file_uploader(
+    "Upload Terraform/IaC file",
+    type=[
+        "tf",
+        "tfvars",
+        "yaml",
+        "yml",
+        "json",
+    ],
 )
 
-st.sidebar.divider()
+if uploaded is not None:
 
-st.sidebar.write(
-    f"**File:** {st.session_state.filename}"
+    try:
+        uploaded_text = uploaded.read().decode(
+            "utf-8",
+            errors="replace",
+        )
+
+        st.session_state.terraform_code = uploaded_text
+        st.session_state.filename = uploaded.name
+
+        add_audit(
+            "File upload",
+            uploaded.name,
+        )
+
+    except Exception as exc:
+        st.error(
+            f"Could not read uploaded file: {exc}"
+        )
+
+
+# ============================================================
+# CODE EDITOR
+# ============================================================
+
+st.subheader("📝 IaC Code")
+
+st.session_state.terraform_code = st.text_area(
+    "Terraform/IaC",
+    value=st.session_state.terraform_code,
+    height=420,
 )
+
+st.session_state.filename = st.text_input(
+    "Filename",
+    value=st.session_state.filename,
+)
+
+
+# ============================================================
+# VALIDATION BUTTON
+# ============================================================
+
+col1, col2, col3 = st.columns(3)
+
+with col1:
+    run_validation = st.button(
+        "🔎 Run Checkov",
+        use_container_width=True,
+    )
+
+with col2:
+    validate_cvs = st.button(
+        "🔐 Validate Through CVS",
+        use_container_width=True,
+    )
+
+with col3:
+    create_correction = st.button(
+        "🛠️ Suggest Correction",
+        use_container_width=True,
+    )
+
+
+if run_validation:
+
+    with st.spinner("Running Checkov..."):
+
+        result = run_checkov(
+            st.session_state.terraform_code,
+            st.session_state.filename,
+        )
+
+    st.session_state.checkov_result = result
+
+    add_audit(
+        "Checkov validation",
+        f"Status: {result['status']}",
+    )
+
+    add_history(
+        f"Checkov validation: {result['status']}"
+    )
+
+
+if validate_cvs:
+
+    with st.spinner(
+        "CVS → Checkov validation → CVS commit..."
+    ):
+
+        result = cvs_validate_and_commit()
+
+    if result["ok"]:
+        st.success(
+            "Checkov validation passed and the "
+            "configuration was committed to CVS."
+        )
+    else:
+        st.error(
+            result["message"]
+        )
+
+    if result.get("checkov"):
+        st.session_state.checkov_result = (
+            result["checkov"]
+        )
+
+
+if create_correction:
+
+    findings = []
+
+    if st.session_state.checkov_result:
+        findings = st.session_state.checkov_result.get(
+            "findings",
+            [],
+        )
+
+    corrected = generate_correction(
+        st.session_state.terraform_code,
+    )
+
+    if corrected:
+
+        st.session_state.suggested_code = corrected
+
+        add_audit(
+            "Correction generated",
+            "Generated a restricted SSH example correction.",
+        )
+
+        st.success(
+            "A suggested correction was generated."
+        )
+
+    elif findings:
+
+        finding = next(
+            (
+                item
+                for item in findings
+                if item["status"] == "FAILED"
+            ),
+            findings[0],
+        )
+
+        st.session_state.ai_explanation = (
+            get_ai_explanation(finding)
+        )
+
+        st.info(
+            "An explanation was generated for the finding."
+        )
+
+    else:
+
+        st.info(
+            "Run Checkov first or use the unsafe demo."
+        )
+
+
+# ============================================================
+# CHECKOV RESULTS
+# ============================================================
 
 result = st.session_state.checkov_result
 
 if result:
 
+    st.subheader("📊 Checkov Results")
+
     if result["status"] == "PASSED":
-        st.sidebar.success("Validation Passed")
+
+        st.markdown(
+            '<div class="status-pass">'
+            '✅ Validation PASSED — no failed checks '
+            'were reported by Checkov.'
+            '</div>',
+            unsafe_allow_html=True,
+        )
 
     elif result["status"] == "FAILED":
-        st.sidebar.error("Security Findings Found")
+
+        st.markdown(
+            '<div class="status-fail">'
+            '❌ Validation FAILED — security/policy '
+            'violations were detected.'
+            '</div>',
+            unsafe_allow_html=True,
+        )
 
     else:
-        st.sidebar.warning("Validation Error")
 
-else:
-    st.sidebar.info("Validation not run")
-
-
-# ============================================================
-# DASHBOARD
-# ============================================================
-
-if page == "Dashboard":
-
-    st.markdown(
-        '<div class="main-title">🔎 AI-IAC Validator</div>',
-        unsafe_allow_html=True,
-    )
-
-    st.markdown(
-        """
-        <div class="subtitle">
-        AI-assisted Infrastructure-as-Code configuration
-        validation using Terraform and Checkov.
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    col1, col2, col3, col4 = st.columns(4)
-
-    result = st.session_state.checkov_result
-
-    passed = result["passed"] if result else 0
-    failed = result["failed"] if result else 0
-    skipped = result["skipped"] if result else 0
-
-    col1.metric(
-        "Passed",
-        passed,
-    )
-
-    col2.metric(
-        "Failed",
-        failed,
-    )
-
-    col3.metric(
-        "Skipped",
-        skipped,
-    )
-
-    col4.metric(
-        "Validations",
-        len(
-            st.session_state.validation_history
-        ),
-    )
-
-    st.divider()
-
-    st.subheader("Project Workflow")
-
-    workflow = [
-        "1. Upload or edit Terraform",
-        "2. Run Checkov validation",
-        "3. Review security findings",
-        "4. Generate AI explanation",
-        "5. Generate suggested correction",
-        "6. Re-validate corrected configuration",
-        "7. Compare Before/After",
-        "8. Generate report",
-    ]
-
-    for item in workflow:
-        st.write("✅ " + item)
-
-    st.divider()
-
-    st.subheader("Current Configuration")
-
-    st.code(
-        st.session_state.terraform_code,
-        language="hcl",
-    )
-
-
-# ============================================================
-# IAC CONFIGURATION
-# ============================================================
-
-elif page == "IaC Configuration":
-
-    st.title("🧩 IaC Configuration")
-
-    st.write(
-        "Upload, edit, validate, and download Terraform configuration."
-    )
-
-    uploaded_file = st.file_uploader(
-        "Upload Terraform file",
-        type=["tf"],
-    )
-
-    if uploaded_file:
-
-        uploaded_code = uploaded_file.read().decode(
-            "utf-8",
-            errors="replace",
+        st.markdown(
+            '<div class="status-info">'
+            '⚠️ Validation could not be completed.'
+            '</div>',
+            unsafe_allow_html=True,
         )
 
-        st.session_state.terraform_code = uploaded_code
-        st.session_state.filename = uploaded_file.name
+    if result["status"] == "ERROR":
 
-        add_audit(
-            "Terraform uploaded",
-            uploaded_file.name,
-        )
+        st.error(result["error"])
 
-        st.success(
-            f"Loaded {uploaded_file.name}"
-        )
+    else:
 
-    col1, col2 = st.columns(2)
+        m1, m2, m3 = st.columns(3)
 
-    with col1:
-
-        if st.button(
-            "Load Unsafe Demo",
-            use_container_width=True,
-        ):
-
-            st.session_state.terraform_code = UNSAFE_DEMO
-            st.session_state.filename = "unsafe_demo.tf"
-            st.session_state.checkov_result = None
-
-            add_history(
-                "Loaded unsafe Terraform demo"
-            )
-
-            add_audit(
-                "Demo loaded",
-                "unsafe_demo.tf",
-            )
-
-            st.rerun()
-
-    with col2:
-
-        if st.button(
-            "Load Safe Demo",
-            use_container_width=True,
-        ):
-
-            st.session_state.terraform_code = SAFE_DEMO
-            st.session_state.filename = "safe_demo.tf"
-            st.session_state.checkov_result = None
-
-            add_history(
-                "Loaded safe Terraform demo"
-            )
-
-            add_audit(
-                "Demo loaded",
-                "safe_demo.tf",
-            )
-
-            st.rerun()
-
-    st.divider()
-
-    filename = st.text_input(
-        "Terraform filename",
-        value=st.session_state.filename,
-    )
-
-    st.session_state.filename = filename
-
-    code = st.text_area(
-        "Terraform configuration",
-        value=st.session_state.terraform_code,
-        height=500,
-    )
-
-    if code != st.session_state.terraform_code:
-
-        st.session_state.previous_code = (
-            st.session_state.terraform_code
-        )
-
-        st.session_state.terraform_code = code
-
-    st.download_button(
-        "⬇️ Download Terraform",
-        data=st.session_state.terraform_code,
-        file_name=st.session_state.filename,
-        mime="text/plain",
-        use_container_width=True,
-    )
-
-
-# ============================================================
-# CHECKOV VALIDATION
-# ============================================================
-
-elif page == "Checkov Validation":
-
-    st.title("🔍 Checkov Validation")
-
-    st.write(
-        "Run the actual Checkov scanner against the current Terraform configuration."
-    )
-
-    col1, col2 = st.columns([3, 1])
-
-    with col1:
-        st.info(
-            st.session_state.filename
-        )
-
-    with col2:
-
-        checkov_path = get_checkov_path()
-
-        if checkov_path:
-            st.success("Checkov detected")
-        else:
-            st.error("Checkov not detected")
-
-    if st.button(
-        "🔎 Run Checkov Validation",
-        use_container_width=True,
-        type="primary",
-    ):
-
-        with st.spinner(
-            "Running Checkov..."
-        ):
-
-            result = run_checkov(
-                st.session_state.terraform_code,
-                st.session_state.filename,
-            )
-
-        st.session_state.checkov_result = result
-
-        st.session_state.validation_history.append(
-            {
-                "timestamp": datetime.now().strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                ),
-                "filename": st.session_state.filename,
-                "status": result["status"],
-                "passed": result["passed"],
-                "failed": result["failed"],
-                "skipped": result["skipped"],
-            }
-        )
-
-        add_history(
-            f"Checkov validation: {result['status']}"
-        )
-
-        add_audit(
-            "Checkov validation",
-            result["status"],
-        )
-
-        st.rerun()
-
-    result = st.session_state.checkov_result
-
-    if result:
-
-        if result["status"] == "PASSED":
-
-            st.success(
-                "Checkov validation passed."
-            )
-
-        elif result["status"] == "FAILED":
-
-            st.error(
-                "Checkov found security issues."
-            )
-
-        else:
-
-            st.error(
-                result.get(
-                    "error",
-                    "Checkov returned an error.",
-                )
-            )
-
-        col1, col2, col3 = st.columns(3)
-
-        col1.metric(
+        m1.metric(
             "Passed",
             result["passed"],
         )
 
-        col2.metric(
+        m2.metric(
             "Failed",
             result["failed"],
         )
 
-        col3.metric(
+        m3.metric(
             "Skipped",
             result["skipped"],
         )
 
-        if result.get("error"):
+        findings = result["findings"]
 
-            st.warning(
-                result["error"]
+        if findings:
+
+            st.subheader("Security Findings")
+
+            table_rows = []
+
+            for item in findings:
+                table_rows.append(
+                    {
+                        "Status": item["status"],
+                        "Check ID": item["check_id"],
+                        "Check": item["check_name"],
+                        "Severity": item["severity"],
+                        "Resource": item["resource"],
+                    }
+                )
+
+            st.dataframe(
+                pd.DataFrame(table_rows),
+                use_container_width=True,
             )
 
-
-# ============================================================
-# SECURITY FINDINGS
-# ============================================================
-
-elif page == "Security Findings":
-
-    st.title("🚨 Security Findings")
-
-    result = st.session_state.checkov_result
-
-    if not result:
-
-        st.info(
-            "Run Checkov validation first."
-        )
-
-    else:
-
-        findings = result.get(
-            "findings",
-            [],
-        )
-
-        failed_findings = [
-            item
-            for item in findings
-            if item["status"] == "FAILED"
-        ]
-
-        st.metric(
-            "Security findings",
-            len(failed_findings),
-        )
-
-        search = st.text_input(
-            "Search findings"
-        )
-
-        severity = st.selectbox(
-            "Severity",
-            [
-                "All",
-                "CRITICAL",
-                "HIGH",
-                "MEDIUM",
-                "LOW",
-                "UNKNOWN",
-            ],
-        )
-
-        filtered = failed_findings
-
-        if search:
-
-            search_lower = search.lower()
-
-            filtered = [
+            failed = [
                 item
-                for item in filtered
-                if search_lower in (
-                    str(item).lower()
-                )
+                for item in findings
+                if item["status"] == "FAILED"
             ]
 
-        if severity != "All":
+            if failed:
 
-            filtered = [
-                item
-                for item in filtered
-                if item.get(
-                    "severity",
-                    "UNKNOWN",
-                ) == severity
-            ]
-
-        if not filtered:
-
-            st.success(
-                "No matching failed checks."
-            )
-
-        for index, finding in enumerate(
-            filtered
-        ):
-
-            with st.expander(
-                f"{finding['check_id']} — "
-                f"{finding['check_name']}"
-            ):
-
-                st.write(
-                    "**Severity:**",
-                    finding.get(
-                        "severity",
-                        "UNKNOWN",
-                    ),
+                st.subheader(
+                    "❌ Failed Security Checks"
                 )
 
-                st.write(
-                    "**Resource:**",
-                    finding.get(
-                        "resource",
-                        "",
-                    ),
-                )
-
-                st.write(
-                    "**File:**",
-                    finding.get(
-                        "file_path",
-                        "",
-                    ),
-                )
-
-                st.write(
-                    "**Line:**",
-                    finding.get(
-                        "file_line_range",
-                        "",
-                    ),
-                )
-
-                if finding.get(
-                    "guideline"
+                for index, finding in enumerate(
+                    failed,
+                    start=1,
                 ):
 
-                    st.write(
-                        "**Guideline:**"
-                    )
+                    with st.expander(
+                        f"{index}. {finding['check_id']} — {finding['check_name']}"
+                    ):
 
-                    st.write(
-                        finding["guideline"]
-                    )
-
-                if st.button(
-                    "Explain this finding",
-                    key=f"explain_{index}",
-                ):
-
-                    st.session_state.selected_finding = finding
-                    st.session_state.ai_explanation = (
-                        get_ai_explanation(
-                            finding
+                        st.write(
+                            f"**Resource:** {finding['resource']}"
                         )
-                    )
 
-                    add_audit(
-                        "AI explanation generated",
-                        finding["check_id"],
-                    )
+                        st.write(
+                            f"**Severity:** {finding['severity']}"
+                        )
 
-                    st.rerun()
+                        if finding["file_line_range"]:
+                            st.write(
+                                f"**Lines:** {finding['file_line_range']}"
+                            )
+
+                        if finding["guideline"]:
+                            st.write(
+                                f"**Guideline:** {finding['guideline']}"
+                            )
+
+                        if finding["code_block"]:
+                            st.code(
+                                "\n".join(
+                                    finding["code_block"]
+                                ),
+                                language="terraform",
+                            )
+
+                        if st.button(
+                            f"Explain {finding['check_id']}",
+                            key=f"explain_{index}",
+                        ):
+
+                            st.session_state.ai_explanation = (
+                                get_ai_explanation(
+                                    finding
+                                )
+                            )
+
+                            st.rerun()
 
 
 # ============================================================
 # AI EXPLANATION
 # ============================================================
 
-elif page == "AI Explanation":
+if st.session_state.ai_explanation:
 
-    st.title("🤖 AI Explanation")
+    st.subheader("🤖 AI Explanation")
 
-    finding = st.session_state.selected_finding
-
-    if not finding:
-
-        result = st.session_state.checkov_result
-
-        if result:
-
-            failed = [
-                item
-                for item in result.get(
-                    "findings",
-                    [],
-                )
-                if item["status"] == "FAILED"
-            ]
-
-            if failed:
-
-                finding = failed[0]
-
-                st.session_state.selected_finding = finding
-
-    if not finding:
-
-        st.info(
-            "Select a security finding from the Security Findings page."
-        )
-
-    else:
-
-        st.write(
-            f"**{finding['check_id']} — "
-            f"{finding['check_name']}**"
-        )
-
-        if st.button(
-            "🤖 Generate AI Explanation",
-            type="primary",
-        ):
-
-            with st.spinner(
-                "Generating explanation..."
-            ):
-
-                explanation = get_ai_explanation(
-                    finding
-                )
-
-            st.session_state.ai_explanation = explanation
-
-            add_audit(
-                "AI explanation generated",
-                finding["check_id"],
-            )
-
-        if st.session_state.ai_explanation:
-
-            st.markdown(
-                st.session_state.ai_explanation
-            )
+    st.markdown(
+        st.session_state.ai_explanation
+    )
 
 
 # ============================================================
 # SUGGESTED CORRECTION
 # ============================================================
 
-elif page == "Suggested Correction":
+if st.session_state.suggested_code:
 
-    st.title("🛠️ Suggested Correction")
+    st.subheader("🛠️ Suggested Correction")
 
-    result = st.session_state.checkov_result
-
-    if not result:
-
-        st.info(
-            "Run Checkov first."
-        )
-
-    elif result["failed"] == 0:
-
-        st.success(
-            "No failed checks require correction."
-        )
-
-    else:
-
-        if st.button(
-            "Generate Suggested Correction",
-            type="primary",
-        ):
-
-            corrected = generate_correction(
-                st.session_state.terraform_code,
-                result.get(
-                    "findings",
-                    [],
-                ),
-            )
-
-            st.session_state.suggested_code = corrected
-
-            add_audit(
-                "Suggested correction generated"
-            )
-
-            st.rerun()
-
-        if st.session_state.suggested_code:
-
-            st.subheader(
-                "Corrected Terraform"
-            )
-
-            st.code(
-                st.session_state.suggested_code,
-                language="hcl",
-            )
-
-            col1, col2 = st.columns(2)
-
-            with col1:
-
-                if st.button(
-                    "Apply Suggested Correction",
-                    use_container_width=True,
-                ):
-
-                    st.session_state.previous_code = (
-                        st.session_state.terraform_code
-                    )
-
-                    st.session_state.terraform_code = (
-                        st.session_state.suggested_code
-                    )
-
-                    st.session_state.filename = (
-                        "corrected_" +
-                        st.session_state.filename
-                    )
-
-                    add_history(
-                        "Applied suggested correction"
-                    )
-
-                    add_audit(
-                        "Correction applied"
-                    )
-
-                    st.success(
-                        "Correction applied."
-                    )
-
-            with col2:
-
-                st.download_button(
-                    "Download Corrected Terraform",
-                    data=st.session_state.suggested_code,
-                    file_name="corrected_"
-                    + st.session_state.filename,
-                    mime="text/plain",
-                    use_container_width=True,
-                )
-
-
-# ============================================================
-# RE-VALIDATION
-# ============================================================
-
-elif page == "Re-validation":
-
-    st.title("🔄 Re-validation")
-
-    st.write(
-        "Run Checkov again after applying a correction."
+    st.code(
+        st.session_state.suggested_code,
+        language="terraform",
     )
 
     if st.button(
-        "🔄 Re-run Checkov",
-        type="primary",
+        "Use Suggested Correction",
         use_container_width=True,
     ):
 
-        with st.spinner(
-            "Re-validating..."
-        ):
-
-            result = run_checkov(
-                st.session_state.terraform_code,
-                st.session_state.filename,
-            )
-
-        st.session_state.checkov_result = result
-
-        st.session_state.validation_history.append(
-            {
-                "timestamp": datetime.now().strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                ),
-                "filename": st.session_state.filename,
-                "status": result["status"],
-                "passed": result["passed"],
-                "failed": result["failed"],
-                "skipped": result["skipped"],
-            }
+        st.session_state.previous_code = (
+            st.session_state.terraform_code
         )
 
-        add_history(
-            "Re-validation completed"
+        st.session_state.terraform_code = (
+            st.session_state.suggested_code
         )
+
+        st.session_state.suggested_code = ""
 
         add_audit(
-            "Re-validation",
-            result["status"],
-        )
-
-        st.rerun()
-
-    result = st.session_state.checkov_result
-
-    if result:
-
-        col1, col2, col3 = st.columns(3)
-
-        col1.metric(
-            "Passed",
-            result["passed"],
-        )
-
-        col2.metric(
-            "Failed",
-            result["failed"],
-        )
-
-        col3.metric(
-            "Skipped",
-            result["skipped"],
-        )
-
-        if result["status"] == "PASSED":
-
-            st.success(
-                "✅ Validation Gate: PASSED"
-            )
-
-        elif result["status"] == "FAILED":
-
-            st.error(
-                "❌ Validation Gate: FAILED"
-            )
-
-        else:
-
-            st.warning(
-                "⚠️ Validation Gate: ERROR"
-            )
-
-
-# ============================================================
-# BEFORE / AFTER
-# ============================================================
-
-elif page == "Before/After":
-
-    st.title("↔️ Before / After")
-
-    old_code = st.session_state.previous_code
-    new_code = st.session_state.terraform_code
-
-    if not old_code:
-
-        st.info(
-            "No previous configuration is available yet."
-        )
-
-    else:
-
-        col1, col2 = st.columns(2)
-
-        with col1:
-
-            st.subheader("Before")
-
-            st.code(
-                old_code,
-                language="hcl",
-            )
-
-        with col2:
-
-            st.subheader("After")
-
-            st.code(
-                new_code,
-                language="hcl",
-            )
-
-        st.subheader(
-            "Configuration Diff"
-        )
-
-        diff = create_diff(
-            old_code,
-            new_code,
-        )
-
-        if diff:
-
-            st.code(
-                diff,
-                language="diff",
-            )
-
-        else:
-
-            st.info(
-                "No differences detected."
-            )
-
-
-# ============================================================
-# CVS HISTORY
-# ============================================================
-
-elif page == "CVS History":
-
-    st.title("🗂️ CVS History")
-
-    st.write(
-        "Local session history of configuration and validation events."
-    )
-
-    if not st.session_state.history:
-
-        st.info(
-            "No history available."
-        )
-
-    else:
-
-        history_df = pd.DataFrame(
-            st.session_state.history
-        )
-
-        st.dataframe(
-            history_df,
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    st.divider()
-
-    if st.button(
-        "Create Version Snapshot"
-    ):
-
-        snapshot = {
-            "timestamp": datetime.now().strftime(
-                "%Y-%m-%d %H:%M:%S"
-            ),
-            "filename": st.session_state.filename,
-            "code": st.session_state.terraform_code,
-        }
-
-        st.session_state.history.append(
-            {
-                "timestamp": snapshot["timestamp"],
-                "message": "Version snapshot created",
-                "filename": snapshot["filename"],
-            }
-        )
-
-        add_audit(
-            "Version snapshot created"
+            "Correction applied",
+            "User applied suggested Terraform correction.",
         )
 
         st.success(
-            "Version snapshot created."
+            "Correction applied. Run validation again."
         )
-
-
-# ============================================================
-# AUDIT LOG
-# ============================================================
-
-elif page == "Audit Log":
-
-    st.title("📋 Audit Log")
-
-    if not st.session_state.audit_log:
-
-        st.info(
-            "No audit events yet."
-        )
-
-    else:
-
-        audit_df = pd.DataFrame(
-            st.session_state.audit_log
-        )
-
-        st.dataframe(
-            audit_df,
-            use_container_width=True,
-            hide_index=True,
-        )
-
-
-# ============================================================
-# ANALYTICS
-# ============================================================
-
-elif page == "Analytics":
-
-    st.title("📊 Analytics")
-
-    history = st.session_state.validation_history
-
-    if not history:
-
-        st.info(
-            "Run Checkov validations to generate analytics."
-        )
-
-    else:
-
-        df = pd.DataFrame(
-            history
-        )
-
-        col1, col2, col3 = st.columns(3)
-
-        col1.metric(
-            "Total Validations",
-            len(df),
-        )
-
-        col2.metric(
-            "Total Passed Checks",
-            int(
-                df["passed"].sum()
-            ),
-        )
-
-        col3.metric(
-            "Total Failed Checks",
-            int(
-                df["failed"].sum()
-            ),
-        )
-
-        st.subheader(
-            "Validation History"
-        )
-
-        st.dataframe(
-            df,
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        chart_df = df[
-            [
-                "passed",
-                "failed",
-                "skipped",
-            ]
-        ]
-
-        st.line_chart(
-            chart_df
-        )
-
-
-# ============================================================
-# REPORTS
-# ============================================================
-
-elif page == "Reports":
-
-    st.title("📄 Reports")
-
-    result = st.session_state.checkov_result
-
-    if not result:
-
-        st.info(
-            "Run Checkov before generating a report."
-        )
-
-    else:
-
-        st.subheader(
-            "Validation Summary"
-        )
-
-        col1, col2, col3, col4 = st.columns(4)
-
-        col1.metric(
-            "Status",
-            result["status"],
-        )
-
-        col2.metric(
-            "Passed",
-            result["passed"],
-        )
-
-        col3.metric(
-            "Failed",
-            result["failed"],
-        )
-
-        col4.metric(
-            "Skipped",
-            result["skipped"],
-        )
-
-        st.divider()
-
-        st.download_button(
-            "⬇️ Download JSON Report",
-            data=report_json(),
-            file_name="iac_validation_report.json",
-            mime="application/json",
-            use_container_width=True,
-        )
-
-        st.download_button(
-            "⬇️ Download CSV Report",
-            data=report_csv(),
-            file_name="iac_validation_report.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
-
-        st.download_button(
-            "⬇️ Download HTML Report",
-            data=report_html(),
-            file_name="iac_validation_report.html",
-            mime="text/html",
-            use_container_width=True,
-        )
-
-
-# ============================================================
-# SETTINGS
-# ============================================================
-
-elif page == "Settings":
-
-    st.title("⚙️ Settings")
-
-    st.subheader(
-        "Checkov Policy Settings"
-    )
-
-    st.session_state.settings_check = st.text_input(
-        "Run only these checks",
-        value=st.session_state.settings_check,
-        placeholder="Example: CKV_AWS_24,CKV_AWS_25",
-    )
-
-    st.session_state.settings_skip = st.text_input(
-        "Skip these checks",
-        value=st.session_state.settings_skip,
-        placeholder="Example: CKV_AWS_18",
-    )
-
-    st.caption(
-        "Use Checkov check IDs separated by commas."
-    )
-
-    st.divider()
-
-    st.subheader(
-        "Application"
-    )
-
-    if st.button(
-        "Reset Session",
-        type="secondary",
-    ):
-
-        for key in list(
-            st.session_state.keys()
-        ):
-            del st.session_state[key]
 
         st.rerun()
 
 
 # ============================================================
-# TERRAFORM PLAN
+# CVS OPERATIONS
 # ============================================================
 
-elif page == "Terraform Plan":
+st.divider()
 
-    st.title("📦 Terraform Plan")
+st.subheader("📦 CVS Version Control")
 
-    st.write(
-        "Paste Terraform plan JSON for basic structural validation."
-    )
+c1, c2, c3 = st.columns(3)
 
-    plan_text = st.text_area(
-        "Terraform Plan JSON",
-        value=st.session_state.plan_json,
-        height=400,
-        placeholder='{"format_version":"1.0","terraform_version":"1.5.0"}',
-    )
-
-    st.session_state.plan_json = plan_text
+with c1:
 
     if st.button(
-        "Validate Plan JSON",
-        type="primary",
+        "📥 CVS Checkout",
+        use_container_width=True,
     ):
 
-        try:
+        if not st.session_state.cvs_root:
+            st.error("Enter CVSROOT in the sidebar.")
 
-            data = json.loads(
-                plan_text
+        elif not st.session_state.cvs_module:
+            st.error("Enter CVS Module in the sidebar.")
+
+        else:
+
+            workspace = cvs_prepare_workspace()
+
+            result = cvs_checkout(
+                st.session_state.cvs_module,
+                workspace,
             )
 
-            st.success(
-                "Valid JSON Terraform plan structure detected."
-            )
+            if result["ok"]:
+                st.success("CVS checkout successful.")
+                st.session_state.cvs_output = (
+                    result["message"]
+                )
 
-            st.json(data)
+                add_audit(
+                    "CVS checkout",
+                    st.session_state.cvs_module,
+                )
 
-            add_audit(
-                "Terraform plan JSON validated"
-            )
+            else:
+                st.error(result["message"])
 
-        except Exception as exc:
 
+with c2:
+
+    if st.button(
+        "🔄 CVS Update",
+        use_container_width=True,
+    ):
+
+        if not st.session_state.cvs_workspace:
             st.error(
-                f"Invalid JSON: {exc}"
+                "Create or specify a CVS workspace first."
             )
+
+        else:
+
+            result = cvs_update(
+                st.session_state.cvs_workspace
+            )
+
+            if result["ok"]:
+                st.success("CVS update completed.")
+                st.session_state.cvs_output = (
+                    result["message"]
+                )
+
+            else:
+                st.error(result["message"])
+
+
+with c3:
+
+    if st.button(
+        "📜 CVS History",
+        use_container_width=True,
+    ):
+
+        if not st.session_state.cvs_workspace:
+            st.error(
+                "Create or specify a CVS workspace first."
+            )
+
+        else:
+
+            result = cvs_log(
+                st.session_state.cvs_workspace,
+                st.session_state.filename,
+            )
+
+            if result["ok"]:
+                st.code(
+                    result["message"],
+                    language="text",
+                )
+
+            else:
+                st.error(result["message"])
+
+
+if st.session_state.cvs_output:
+
+    with st.expander(
+        "CVS Command Output",
+        expanded=False,
+    ):
+
+        st.code(
+            st.session_state.cvs_output,
+            language="text",
+        )
+
+
+# ============================================================
+# LOCAL AUDIT LOG
+# ============================================================
+
+st.divider()
+
+st.subheader("📝 Application Audit Log")
+
+if st.session_state.audit_log:
+
+    st.dataframe(
+        pd.DataFrame(
+            st.session_state.audit_log
+        ),
+        use_container_width=True,
+    )
+
+else:
+
+    st.info(
+        "No application actions recorded yet."
+    )
+
+
+# ============================================================
+# EXPORT RESULTS
+# ============================================================
+
+st.divider()
+
+st.subheader("📄 Export Results")
+
+if result and result.get("findings"):
+
+    rows = []
+
+    for finding in result["findings"]:
+
+        rows.append(
+            {
+                "Timestamp": datetime.now().strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                ),
+                "Filename": st.session_state.filename,
+                "Status": finding["status"],
+                "Check ID": finding["check_id"],
+                "Check Name": finding["check_name"],
+                "Severity": finding["severity"],
+                "Resource": finding["resource"],
+                "Guideline": finding["guideline"],
+            }
+        )
+
+    df = pd.DataFrame(rows)
+
+    csv_data = df.to_csv(
+        index=False
+    ).encode("utf-8")
+
+    st.download_button(
+        "⬇️ Download Validation Report",
+        data=csv_data,
+        file_name="iac_validation_report.csv",
+        mime="text/csv",
+    )
 
 
 # ============================================================
 # FOOTER
 # ============================================================
 
-st.sidebar.divider()
+st.divider()
 
-st.sidebar.caption(
-    "AI-IAC Validator • Terraform + Checkov"
+st.caption(
+    "AI-IAC Validator | Terraform/IaC Security | "
+    "Checkov | CVS Version Control"
 )
