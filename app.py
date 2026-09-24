@@ -1,120 +1,86 @@
-import os
-import sys
-import json
-import csv
-import shutil
-import tempfile
+import streamlit as st
 import subprocess
+import shutil
+import os
+import re
 from datetime import datetime
 
-import pandas as pd
-import streamlit as st
-
-
 st.set_page_config(
-    page_title="AI-IAC Validator",
-    page_icon="🔎",
-    layout="wide",
-    initial_sidebar_state="expanded",
+    page_title="AI-IAC Configuration Validator",
+    page_icon="🔐",
+    layout="wide"
 )
 
-
-st.markdown(
-    """
-    <style>
-    .main-title {
-        font-size: 42px;
-        font-weight: 800;
-        margin-bottom: 5px;
+if "policy" not in st.session_state:
+    st.session_state.policy = {
+        "block_public_ssh": True,
+        "trusted_ssh_cidr": "10.0.0.0/24",
+        "block_public_rdp": True,
+        "require_s3_public_access_block": True,
+        "require_storage_encryption": True
     }
 
-    .subtitle {
-        font-size: 18px;
-        color: #555;
-        margin-bottom: 25px;
-    }
+if "validation_history" not in st.session_state:
+    st.session_state.validation_history = []
 
-    .status-pass {
-        background: #dff6e7;
-        padding: 14px;
-        border-radius: 10px;
-        color: #126b36;
-        font-weight: 600;
-    }
+if "audit_log" not in st.session_state:
+    st.session_state.audit_log = []
 
-    .status-fail {
-        background: #ffe1e1;
-        padding: 14px;
-        border-radius: 10px;
-        color: #a40000;
-        font-weight: 600;
-    }
-
-    .status-info {
-        background: #e7f0ff;
-        padding: 14px;
-        border-radius: 10px;
-        color: #174a9c;
-        font-weight: 600;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-
-UNSAFE_DEMO = """terraform {
-  required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = "~> 5.0"
-    }
-  }
-}
-
-provider "aws" {
-  region = "us-east-1"
-}
-
-resource "aws_security_group" "demo" {
-  name = "unsafe-demo-security-group"
+if "terraform_code" not in st.session_state:
+    st.session_state.terraform_code = """resource "aws_security_group" "example" {
+  name = "example"
 
   ingress {
-    description = "SSH open to the internet"
     from_port   = 22
     to_port     = 22
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
+  ingress {
+    from_port   = 3389
+    to_port     = 3389
+    protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
 }
 """
 
+if "last_result" not in st.session_state:
+    st.session_state.last_result = None
 
-SAFE_DEMO = """terraform {
-  required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = "~> 5.0"
-    }
-  }
-}
+if "last_checkov_output" not in st.session_state:
+    st.session_state.last_checkov_output = ""
 
-provider "aws" {
-  region = "us-east-1"
-}
+if "last_policy_findings" not in st.session_state:
+    st.session_state.last_policy_findings = []
 
-resource "aws_security_group" "demo" {
-  name = "safe-demo-security-group"
+if "cvs_result" not in st.session_state:
+    st.session_state.cvs_result = ""
+
+UNSAFE_TERRAFORM = """resource "aws_security_group" "example" {
+  name = "example"
 
   ingress {
-    description = "SSH restricted to internal network"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    from_port   = 3389
+    to_port     = 3389
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+"""
+
+SAFE_TERRAFORM = """resource "aws_security_group" "example" {
+  name = "example"
+
+  ingress {
     from_port   = 22
     to_port     = 22
     protocol    = "tcp"
@@ -122,1523 +88,633 @@ resource "aws_security_group" "demo" {
   }
 
   egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["10.0.0.0/24"]
   }
 }
 """
 
-
-def initialize_state():
-    defaults = {
-        "terraform_code": SAFE_DEMO,
-        "filename": "safe_demo.tf",
-        "checkov_result": None,
-        "previous_code": "",
-        "history": [],
-        "audit_log": [],
-        "ai_explanation": "",
-        "suggested_code": "",
-        "validation_history": [],
-        "settings_check": "",
-        "settings_skip": "",
-        "selected_finding": None,
-        "cvs_output": "",
-        "cvs_repository": "",
-        "cvs_module": "",
-        "cvs_username": "",
-        "cvs_password": "",
-        "cvs_root": "",
-        "cvs_workspace": "",
-        "cvs_ready": False,
-    }
-
-    for key, value in defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = value
-
-
-initialize_state()
-
-
-def add_audit(action, details=""):
-    st.session_state.audit_log.append(
+def add_audit(message):
+    st.session_state.audit_log.insert(
+        0,
         {
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "action": action,
-            "details": details,
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "message": message
         }
     )
-
-
-def add_history(message):
-    st.session_state.history.append(
-        {
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "message": message,
-            "filename": st.session_state.filename,
-        }
-    )
-
-
-def get_executable(name):
-    path = shutil.which(name)
-
-    if path:
-        return path
-
-    python_dir = os.path.dirname(sys.executable)
-
-    possible = [
-        os.path.join(python_dir, name),
-        os.path.join(python_dir, name + ".exe"),
-    ]
-
-    for item in possible:
-        if os.path.exists(item):
-            return item
-
-    return None
-
 
 def get_checkov_path():
-    return get_executable("checkov")
+    return shutil.which("checkov")
 
+def run_checkov(terraform_code):
+    checkov_path = get_checkov_path()
 
-def get_cvs_path():
-    return get_executable("cvs")
+    if not checkov_path:
+        return False, "Checkov executable was not found. Install Checkov using the requirements.txt file."
 
+    temp_file = "temporary_iac.tf"
 
-def run_command(command, cwd=None, timeout=120, env=None):
     try:
-        process = subprocess.run(
-            command,
-            cwd=cwd,
+        with open(temp_file, "w", encoding="utf-8") as file:
+            file.write(terraform_code)
+
+        result = subprocess.run(
+            [
+                checkov_path,
+                "-f",
+                temp_file,
+                "--framework",
+                "terraform"
+            ],
             capture_output=True,
             text=True,
-            timeout=timeout,
-            env=env,
+            timeout=120
         )
 
-        return {
-            "returncode": process.returncode,
-            "stdout": process.stdout or "",
-            "stderr": process.stderr or "",
-            "error": "",
-        }
+        output = (result.stdout or "") + "\n" + (result.stderr or "")
 
-    except FileNotFoundError:
-        return {
-            "returncode": -1,
-            "stdout": "",
-            "stderr": "",
-            "error": f"Command not found: {command[0]}",
-        }
+        passed = result.returncode == 0
 
-    except subprocess.TimeoutExpired:
-        return {
-            "returncode": -1,
-            "stdout": "",
-            "stderr": "",
-            "error": "Command timed out.",
-        }
+        return passed, output
 
-    except Exception as exc:
-        return {
-            "returncode": -1,
-            "stdout": "",
-            "stderr": "",
-            "error": str(exc),
-        }
+    except Exception as error:
+        return False, str(error)
 
+    finally:
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
 
-def extract_json(text):
-    if not text:
-        return None
-
-    try:
-        return json.loads(text.strip())
-    except Exception:
-        pass
-
-    start = text.find("{")
-    end = text.rfind("}")
-
-    if start != -1 and end != -1:
-        try:
-            return json.loads(text[start:end + 1])
-        except Exception:
-            pass
-
-    return None
-
-
-def parse_checkov_results(data):
+def check_company_policy(terraform_code, policy):
     findings = []
 
-    results = data.get("results", {})
+    if policy["block_public_ssh"]:
+        ssh_public_pattern = re.search(
+            r"from_port\s*=\s*22[\s\S]{0,500}?cidr_blocks\s*=\s*\[\s*\"0\.0\.0\.0/0\"",
+            terraform_code
+        )
 
-    failed_checks = results.get("failed_checks", [])
-    passed_checks = results.get("passed_checks", [])
-    skipped_checks = results.get("skipped_checks", [])
-
-    for status, items in [
-        ("FAILED", failed_checks),
-        ("PASSED", passed_checks),
-        ("SKIPPED", skipped_checks),
-    ]:
-        for item in items:
+        if ssh_public_pattern:
             findings.append(
-                {
-                    "status": status,
-                    "check_id": item.get("check_id", "Unknown"),
-                    "check_name": item.get(
-                        "check_name",
-                        item.get("check", "Unknown check"),
-                    ),
-                    "severity": item.get("severity", "UNKNOWN"),
-                    "resource": item.get(
-                        "resource",
-                        item.get("resource_address", "Unknown"),
-                    ),
-                    "file_path": item.get("file_path", ""),
-                    "file_line_range": item.get(
-                        "file_line_range",
-                        "",
-                    ),
-                    "guideline": item.get("guideline", ""),
-                    "code_block": item.get("code_block", []),
-                }
+                "SSH port 22 is publicly accessible from 0.0.0.0/0."
+            )
+
+    if policy["block_public_rdp"]:
+        rdp_public_pattern = re.search(
+            r"from_port\s*=\s*3389[\s\S]{0,500}?cidr_blocks\s*=\s*\[\s*\"0\.0\.0\.0/0\"",
+            terraform_code
+        )
+
+        if rdp_public_pattern:
+            findings.append(
+                "RDP port 3389 is publicly accessible from 0.0.0.0/0."
+            )
+
+    if policy["require_s3_public_access_block"]:
+        if "aws_s3_bucket_public_access_block" not in terraform_code:
+            if "aws_s3_bucket" in terraform_code:
+                findings.append(
+                    "S3 bucket public access block configuration is missing."
+                )
+
+    if policy["require_storage_encryption"]:
+        storage_detected = (
+            "aws_db_instance" in terraform_code
+            or "aws_ebs_volume" in terraform_code
+            or "aws_s3_bucket" in terraform_code
+        )
+
+        encryption_detected = (
+            "encrypted = true" in terraform_code
+            or "server_side_encryption_configuration" in terraform_code
+            or "kms_key_id" in terraform_code
+        )
+
+        if storage_detected and not encryption_detected:
+            findings.append(
+                "Storage encryption configuration is missing."
             )
 
     return findings
 
+def explain_findings(checkov_output, policy_findings):
+    explanations = []
 
-def run_checkov(code, filename="main.tf"):
-    checkov_path = get_checkov_path()
+    if policy_findings:
+        for finding in policy_findings:
+            if "SSH port 22" in finding:
+                explanations.append(
+                    "SSH is exposed to the public internet. Restrict port 22 to the approved trusted network."
+                )
+            elif "RDP port 3389" in finding:
+                explanations.append(
+                    "RDP is exposed to the public internet. Restrict port 3389 to an approved internal network."
+                )
+            elif "S3 bucket public access" in finding:
+                explanations.append(
+                    "The S3 configuration does not contain the required public access block settings."
+                )
+            elif "Storage encryption" in finding:
+                explanations.append(
+                    "The storage resource should use encryption to protect stored data."
+                )
 
-    if not checkov_path:
-        return {
-            "status": "ERROR",
-            "findings": [],
-            "passed": 0,
-            "failed": 0,
-            "skipped": 0,
-            "raw": "",
-            "error": (
-                "Checkov was not found. Install it with "
-                "'pip install checkov'."
-            ),
-        }
-
-    temp_dir = tempfile.mkdtemp(prefix="iac_check_")
-    temp_path = os.path.join(temp_dir, filename)
-
-    try:
-        with open(temp_path, "w", encoding="utf-8") as file:
-            file.write(code)
-
-        output_dir = os.path.join(temp_dir, "checkov_output")
-        os.makedirs(output_dir, exist_ok=True)
-
-        command = [
-            checkov_path,
-            "-f",
-            temp_path,
-            "--framework",
-            "terraform",
-            "--output",
-            "json",
-            "--output-file-path",
-            output_dir,
-        ]
-
-        if st.session_state.settings_check.strip():
-            command.extend(
-                [
-                    "--check",
-                    st.session_state.settings_check.strip(),
-                ]
+    if not explanations and checkov_output:
+        if "FAILED" in checkov_output.upper():
+            explanations.append(
+                "Checkov identified one or more infrastructure security checks that require attention."
             )
 
-        if st.session_state.settings_skip.strip():
-            command.extend(
-                [
-                    "--skip-check",
-                    st.session_state.settings_skip.strip(),
-                ]
-            )
-
-        result = run_command(
-            command,
-            timeout=180,
+    if not explanations:
+        explanations.append(
+            "No company-policy explanation is required because the current configuration passed the configured policy checks."
         )
 
-        data = None
+    return explanations
 
-        for root, _, files in os.walk(output_dir):
-            for name in files:
-                if name.lower().endswith(".json"):
-                    path = os.path.join(root, name)
+def suggest_correction(terraform_code, policy_findings):
+    corrected_code = terraform_code
 
-                    try:
-                        with open(
-                            path,
-                            "r",
-                            encoding="utf-8",
-                        ) as file:
-                            candidate = json.load(file)
-
-                        if isinstance(candidate, dict):
-                            data = candidate
-                            break
-
-                    except Exception:
-                        continue
-
-            if data:
-                break
-
-        if data is None:
-            data = extract_json(result["stdout"])
-
-        if data is None:
-            return {
-                "status": "ERROR",
-                "findings": [],
-                "passed": 0,
-                "failed": 0,
-                "skipped": 0,
-                "raw": result["stdout"],
-                "error": (
-                    "Checkov did not produce readable JSON.\n\n"
-                    + result["stderr"]
-                ),
-            }
-
-        results = data.get("results", {})
-
-        failed = results.get("failed_checks", [])
-        passed = results.get("passed_checks", [])
-        skipped = results.get("skipped_checks", [])
-
-        return {
-            "status": "FAILED" if failed else "PASSED",
-            "findings": parse_checkov_results(data),
-            "passed": len(passed),
-            "failed": len(failed),
-            "skipped": len(skipped),
-            "raw": data,
-            "error": "",
-        }
-
-    except Exception as exc:
-        return {
-            "status": "ERROR",
-            "findings": [],
-            "passed": 0,
-            "failed": 0,
-            "skipped": 0,
-            "raw": "",
-            "error": str(exc),
-        }
-
-    finally:
-        shutil.rmtree(
-            temp_dir,
-            ignore_errors=True,
+    if any("SSH port 22" in finding for finding in policy_findings):
+        corrected_code = re.sub(
+            r'from_port\s*=\s*22([\s\S]{0,300}?)cidr_blocks\s*=\s*\[\s*"0\.0\.0\.0/0"\s*\]',
+            r'from_port = 22\1cidr_blocks = ["10.0.0.0/24"]',
+            corrected_code
         )
 
-
-def get_ai_explanation(finding):
-    check_id = finding.get(
-        "check_id",
-        "Unknown",
-    )
-
-    check_name = finding.get(
-        "check_name",
-        "Security configuration issue",
-    )
-
-    resource = finding.get(
-        "resource",
-        "Unknown resource",
-    )
-
-    guideline = finding.get(
-        "guideline",
-        "",
-    )
-
-    fallback = f"""
-### Security Finding
-
-**Check ID:** `{check_id}`
-
-**Issue:** {check_name}
-
-**Resource:** `{resource}`
-
-### Why this matters
-
-The Checkov policy identified a configuration
-that may violate a security requirement.
-
-### Recommended approach
-
-Review the affected Terraform resource,
-restrict unnecessary access, and run the
-validation again.
-
-### Checkov guidance
-
-{guideline if guideline else "Review the applicable Checkov policy guidance."}
-"""
-
-    api_key = None
-
-    try:
-        api_key = st.secrets.get(
-            "OPENAI_API_KEY",
-            None,
-        )
-    except Exception:
-        pass
-
-    if not api_key:
-        return fallback
-
-    try:
-        from openai import OpenAI
-
-        client = OpenAI(
-            api_key=api_key,
+    if any("RDP port 3389" in finding for finding in policy_findings):
+        corrected_code = re.sub(
+            r'\n\s*ingress\s*\{\s*from_port\s*=\s*3389[\s\S]*?\n\s*\}',
+            "",
+            corrected_code,
+            flags=re.MULTILINE
         )
 
-        response = client.chat.completions.create(
-            model=os.getenv(
-                "OPENAI_MODEL",
-                "gpt-4o-mini",
-            ),
-            messages=[
-                {
-                    "role": "user",
-                    "content": f"""
-Explain this Checkov Terraform security finding
-to a college student.
+    return corrected_code
 
-Check ID: {check_id}
-Check name: {check_name}
-Resource: {resource}
-Guideline: {guideline}
+def cvs_available():
+    return shutil.which("cvs") is not None
 
-Explain:
-1. What the problem means.
-2. Why it matters.
-3. What should be changed.
-4. How to revalidate it.
-
-Do not invent facts.
-""",
-                }
-            ],
-            temperature=0.2,
-        )
-
-        return response.choices[0].message.content
-
-    except Exception:
-        return fallback
-
-
-def generate_correction(code):
-    corrected = code
-
-    changed = False
-
-    if 'cidr_blocks = ["0.0.0.0/0"]' in corrected:
-        corrected = corrected.replace(
-            'cidr_blocks = ["0.0.0.0/0"]',
-            'cidr_blocks = ["10.0.0.0/24"]',
-            1,
-        )
-
-        changed = True
-
-    if changed:
-        return corrected
-
-    return ""
-
-
-# ============================================================
-# CVS FUNCTIONS
-# ============================================================
-
-def cvs_environment():
-    env = os.environ.copy()
-
-    if st.session_state.cvs_root.strip():
-        env["CVSROOT"] = st.session_state.cvs_root.strip()
-
-    return env
-
-
-def cvs_is_available():
-    return get_cvs_path() is not None
-
-
-def cvs_status():
-    cvs_path = get_cvs_path()
+def run_cvs_command(arguments, workspace=None):
+    cvs_path = shutil.which("cvs")
 
     if not cvs_path:
-        return {
-            "ok": False,
-            "message": "CVS executable was not found.",
-        }
+        return False, "CVS executable was not found on this system."
 
-    result = run_command(
-        [cvs_path, "--version"],
-        timeout=30,
-        env=cvs_environment(),
-    )
+    try:
+        result = subprocess.run(
+            [cvs_path] + arguments,
+            cwd=workspace if workspace else None,
+            capture_output=True,
+            text=True,
+            timeout=120
+        )
 
-    if result["returncode"] != 0:
-        return {
-            "ok": False,
-            "message": result["stderr"] or result["error"],
-        }
+        output = (result.stdout or "") + "\n" + (result.stderr or "")
 
-    return {
-        "ok": True,
-        "message": result["stdout"],
-    }
+        return result.returncode == 0, output
 
+    except Exception as error:
+        return False, str(error)
 
-def cvs_checkout(module, workspace):
-    cvs_path = get_cvs_path()
-
-    if not cvs_path:
-        return {
-            "ok": False,
-            "message": "CVS executable was not found.",
-        }
-
+def cvs_checkout(repository, module, workspace):
     os.makedirs(workspace, exist_ok=True)
 
-    command = [
-        cvs_path,
-        "-d",
-        st.session_state.cvs_root.strip(),
-        "checkout",
-        module,
-    ]
-
-    result = run_command(
-        command,
-        cwd=workspace,
-        timeout=120,
-        env=cvs_environment(),
-    )
-
-    ok = result["returncode"] == 0
-
-    return {
-        "ok": ok,
-        "message": (
-            result["stdout"]
-            if ok
-            else result["stderr"] or result["error"]
-        ),
-    }
-
-
-def cvs_update(workspace):
-    cvs_path = get_cvs_path()
-
-    if not cvs_path:
-        return {
-            "ok": False,
-            "message": "CVS executable was not found.",
-        }
-
-    result = run_command(
-        [cvs_path, "update"],
-        cwd=workspace,
-        timeout=120,
-        env=cvs_environment(),
-    )
-
-    return {
-        "ok": result["returncode"] == 0,
-        "message": (
-            result["stdout"]
-            if result["returncode"] == 0
-            else result["stderr"] or result["error"]
-        ),
-    }
-
-
-def cvs_add(workspace, filename):
-    cvs_path = get_cvs_path()
-
-    if not cvs_path:
-        return {
-            "ok": False,
-            "message": "CVS executable was not found.",
-        }
-
-    result = run_command(
+    return run_cvs_command(
         [
-            cvs_path,
-            "add",
-            filename,
+            "-d",
+            repository,
+            "checkout",
+            module
         ],
-        cwd=workspace,
-        timeout=60,
-        env=cvs_environment(),
+        workspace
     )
 
-    return {
-        "ok": result["returncode"] == 0,
-        "message": (
-            result["stdout"]
-            if result["returncode"] == 0
-            else result["stderr"] or result["error"]
-        ),
-    }
-
-
-def cvs_diff(workspace, filename):
-    cvs_path = get_cvs_path()
-
-    if not cvs_path:
-        return {
-            "ok": False,
-            "message": "CVS executable was not found.",
-        }
-
-    result = run_command(
+def cvs_update(repository, workspace):
+    return run_cvs_command(
         [
-            cvs_path,
-            "diff",
-            "-u",
-            filename,
+            "-d",
+            repository,
+            "update",
+            "-dP"
         ],
-        cwd=workspace,
-        timeout=60,
-        env=cvs_environment(),
+        workspace
     )
 
-    return {
-        "ok": True,
-        "message": result["stdout"] or result["stderr"],
-    }
-
-
-def cvs_commit(workspace, filename, message):
-    cvs_path = get_cvs_path()
-
-    if not cvs_path:
-        return {
-            "ok": False,
-            "message": "CVS executable was not found.",
-        }
-
-    result = run_command(
+def cvs_history(repository, module):
+    return run_cvs_command(
         [
-            cvs_path,
+            "-d",
+            repository,
+            "log",
+            module
+        ]
+    )
+
+def cvs_commit(repository, workspace, message):
+    return run_cvs_command(
+        [
+            "-d",
+            repository,
             "commit",
             "-m",
-            message,
-            filename,
+            message
         ],
-        cwd=workspace,
-        timeout=120,
-        env=cvs_environment(),
+        workspace
     )
 
-    return {
-        "ok": result["returncode"] == 0,
-        "message": (
-            result["stdout"]
-            if result["returncode"] == 0
-            else result["stderr"] or result["error"]
-        ),
-    }
-
-
-def cvs_log(workspace, filename):
-    cvs_path = get_cvs_path()
-
-    if not cvs_path:
-        return {
-            "ok": False,
-            "message": "CVS executable was not found.",
-        }
-
-    result = run_command(
-        [
-            cvs_path,
-            "log",
-            filename,
-        ],
-        cwd=workspace,
-        timeout=60,
-        env=cvs_environment(),
-    )
-
-    return {
-        "ok": result["returncode"] == 0,
-        "message": (
-            result["stdout"]
-            if result["returncode"] == 0
-            else result["stderr"] or result["error"]
-        ),
-    }
-
-
-def cvs_prepare_workspace():
-    if not st.session_state.cvs_workspace.strip():
-        st.session_state.cvs_workspace = tempfile.mkdtemp(
-            prefix="cvs_workspace_"
-        )
-
-    os.makedirs(
-        st.session_state.cvs_workspace,
-        exist_ok=True,
-    )
-
-    return st.session_state.cvs_workspace
-
-
-def save_code_to_cvs_workspace():
-    workspace = cvs_prepare_workspace()
-
-    path = os.path.join(
-        workspace,
-        st.session_state.filename,
-    )
-
-    with open(
-        path,
-        "w",
-        encoding="utf-8",
-    ) as file:
-        file.write(
-            st.session_state.terraform_code
-        )
-
-    return path
-
-
-def cvs_validate_and_commit():
-    if not cvs_is_available():
-        return {
-            "ok": False,
-            "message": (
-                "CVS is not installed on the machine "
-                "running this application."
-            ),
-        }
-
-    if not st.session_state.cvs_root.strip():
-        return {
-            "ok": False,
-            "message": (
-                "Enter the CVSROOT in the CVS Settings "
-                "before using CVS."
-            ),
-        }
-
-    if not st.session_state.cvs_module.strip():
-        return {
-            "ok": False,
-            "message": (
-                "Enter the CVS module name in CVS Settings."
-            ),
-        }
-
-    workspace = cvs_prepare_workspace()
-
-    checkout = cvs_checkout(
-        st.session_state.cvs_module.strip(),
-        workspace,
-    )
-
-    if not checkout["ok"]:
-        return checkout
-
-    st.session_state.terraform_code = st.session_state.terraform_code
-
-    path = os.path.join(
-        workspace,
-        st.session_state.filename,
-    )
-
-    with open(
-        path,
-        "w",
-        encoding="utf-8",
-    ) as file:
-        file.write(
-            st.session_state.terraform_code
-        )
-
-    update = cvs_update(workspace)
-
-    if not update["ok"]:
-        return update
-
-    add_result = cvs_add(
-        workspace,
-        st.session_state.filename,
-    )
-
-    if not add_result["ok"]:
-        message = add_result["message"].lower()
-
-        if "already" not in message and "cvs/entries" not in message:
-            return add_result
-
-    result = run_checkov(
-        st.session_state.terraform_code,
-        st.session_state.filename,
-    )
-
-    st.session_state.checkov_result = result
-
-    add_audit(
-        "CVS validation",
-        f"Checkov status: {result['status']}",
-    )
-
-    if result["status"] != "PASSED":
-        return {
-            "ok": False,
-            "message": (
-                "CVS commit blocked because Checkov "
-                "reported security failures."
-            ),
-            "checkov": result,
-        }
-
-    commit = cvs_commit(
-        workspace,
-        st.session_state.filename,
-        "Validated IaC security configuration",
-    )
-
-    if commit["ok"]:
-        add_history(
-            "Checkov validation passed and configuration committed to CVS."
-        )
-
-        add_audit(
-            "CVS commit",
-            "Successful CVS commit after Checkov validation.",
-        )
-
-    return {
-        "ok": commit["ok"],
-        "message": commit["message"],
-        "checkov": result,
-    }
-
-
-# ============================================================
-# HEADER
-# ============================================================
-
-st.markdown(
-    '<div class="main-title">🔎 AI-IAC Validator</div>',
-    unsafe_allow_html=True,
+st.title("🔐 AI-IAC Configuration Validator")
+st.write(
+    "Validate Terraform Infrastructure as Code against company security policies and Checkov before CVS commit."
 )
 
-st.markdown(
-    """
-    <div class="subtitle">
-    Terraform/IaC security validation using Checkov,
-    CVS version control and optional AI explanations.
-    </div>
-    """,
-    unsafe_allow_html=True,
+st.sidebar.header("Company Security Policy")
+
+block_public_ssh = st.sidebar.checkbox(
+    "Block public SSH",
+    value=st.session_state.policy["block_public_ssh"]
 )
 
-
-# ============================================================
-# SIDEBAR
-# ============================================================
-
-with st.sidebar:
-
-    st.header("⚙️ Configuration")
-
-    st.session_state.settings_check = st.text_input(
-        "Checkov checks",
-        value=st.session_state.settings_check,
-        help="Example: CKV_AWS_18,CKV_AWS_19",
-    )
-
-    st.session_state.settings_skip = st.text_input(
-        "Skip Checkov checks",
-        value=st.session_state.settings_skip,
-        help="Example: CKV_AWS_999",
-    )
-
-    st.divider()
-
-    st.header("📦 CVS Settings")
-
-    st.session_state.cvs_root = st.text_input(
-        "CVSROOT",
-        value=st.session_state.cvs_root,
-        placeholder="Example: /path/to/cvs/repository",
-        type="default",
-    )
-
-    st.session_state.cvs_module = st.text_input(
-        "CVS Module",
-        value=st.session_state.cvs_module,
-        placeholder="Example: iac-project",
-    )
-
-    st.session_state.cvs_username = st.text_input(
-        "CVS Username",
-        value=st.session_state.cvs_username,
-    )
-
-    st.session_state.cvs_workspace = st.text_input(
-        "CVS Workspace",
-        value=st.session_state.cvs_workspace,
-        placeholder="Leave empty for temporary workspace",
-    )
-
-    if st.button(
-        "🔍 Check CVS Installation",
-        use_container_width=True,
-    ):
-        status = cvs_status()
-
-        if status["ok"]:
-            st.success("CVS is installed.")
-            st.code(status["message"])
-        else:
-            st.error(status["message"])
-
-    st.divider()
-
-    st.info(
-        "CVS is the version-control system. "
-        "Checkov performs the security validation."
-    )
-
-
-# ============================================================
-# DEMO BUTTONS
-# ============================================================
-
-st.subheader("🎯 Demonstration")
-
-demo_col1, demo_col2 = st.columns(2)
-
-with demo_col1:
-    if st.button(
-        "Load Unsafe Demo",
-        use_container_width=True,
-    ):
-        st.session_state.terraform_code = UNSAFE_DEMO
-        st.session_state.filename = "unsafe_demo.tf"
-        st.session_state.checkov_result = None
-        st.session_state.ai_explanation = ""
-        st.session_state.suggested_code = ""
-        st.rerun()
-
-with demo_col2:
-    if st.button(
-        "Load Safe Demo",
-        use_container_width=True,
-    ):
-        st.session_state.terraform_code = SAFE_DEMO
-        st.session_state.filename = "safe_demo.tf"
-        st.session_state.checkov_result = None
-        st.session_state.ai_explanation = ""
-        st.session_state.suggested_code = ""
-        st.rerun()
-
-
-# ============================================================
-# UPLOAD
-# ============================================================
-
-uploaded = st.file_uploader(
-    "Upload Terraform/IaC file",
-    type=[
-        "tf",
-        "tfvars",
-        "yaml",
-        "yml",
-        "json",
-    ],
+trusted_ssh_cidr = st.sidebar.text_input(
+    "Trusted SSH CIDR",
+    value=st.session_state.policy["trusted_ssh_cidr"]
 )
 
-if uploaded is not None:
+block_public_rdp = st.sidebar.checkbox(
+    "Block public RDP",
+    value=st.session_state.policy["block_public_rdp"]
+)
 
-    try:
-        uploaded_text = uploaded.read().decode(
+require_s3_public_access_block = st.sidebar.checkbox(
+    "Require S3 public access block",
+    value=st.session_state.policy["require_s3_public_access_block"]
+)
+
+require_storage_encryption = st.sidebar.checkbox(
+    "Require storage encryption",
+    value=st.session_state.policy["require_storage_encryption"]
+)
+
+if st.sidebar.button("Save Policy Baseline"):
+    st.session_state.policy = {
+        "block_public_ssh": block_public_ssh,
+        "trusted_ssh_cidr": trusted_ssh_cidr,
+        "block_public_rdp": block_public_rdp,
+        "require_s3_public_access_block": require_s3_public_access_block,
+        "require_storage_encryption": require_storage_encryption
+    }
+
+    add_audit("Company security policy baseline updated.")
+    st.sidebar.success("Policy baseline saved.")
+
+st.sidebar.subheader("Active Policy")
+
+st.sidebar.write(
+    {
+        "Public SSH blocked": st.session_state.policy["block_public_ssh"],
+        "Trusted SSH network": st.session_state.policy["trusted_ssh_cidr"],
+        "Public RDP blocked": st.session_state.policy["block_public_rdp"],
+        "S3 public access block": st.session_state.policy["require_s3_public_access_block"],
+        "Storage encryption": st.session_state.policy["require_storage_encryption"]
+    }
+)
+
+st.sidebar.subheader("CVS Configuration")
+
+cvs_repository = st.sidebar.text_input(
+    "CVS Repository",
+    value="C:/cvsrepo"
+)
+
+cvs_module = st.sidebar.text_input(
+    "CVS Module",
+    value="iac-project"
+)
+
+cvs_workspace = st.sidebar.text_input(
+    "CVS Workspace",
+    value="C:/cvsworkspace"
+)
+
+tabs = st.tabs(
+    [
+        "Terraform Validation",
+        "Policy",
+        "CVS",
+        "Validation History",
+        "Audit Log"
+    ]
+)
+
+with tabs[0]:
+
+    st.header("Terraform Infrastructure Code")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        if st.button("Load Unsafe Demo"):
+            st.session_state.terraform_code = UNSAFE_TERRAFORM
+            add_audit("Unsafe Terraform demonstration loaded.")
+
+    with col2:
+        if st.button("Load Safe Demo"):
+            st.session_state.terraform_code = SAFE_TERRAFORM
+            add_audit("Safe Terraform demonstration loaded.")
+
+    uploaded_file = st.file_uploader(
+        "Upload Terraform file",
+        type=["tf"]
+    )
+
+    if uploaded_file:
+        st.session_state.terraform_code = uploaded_file.read().decode(
             "utf-8",
-            errors="replace",
+            errors="replace"
         )
-
-        st.session_state.terraform_code = uploaded_text
-        st.session_state.filename = uploaded.name
 
         add_audit(
-            "File upload",
-            uploaded.name,
+            "Terraform file uploaded: " + uploaded_file.name
         )
 
-    except Exception as exc:
-        st.error(
-            f"Could not read uploaded file: {exc}"
-        )
-
-
-# ============================================================
-# CODE EDITOR
-# ============================================================
-
-st.subheader("📝 IaC Code")
-
-st.session_state.terraform_code = st.text_area(
-    "Terraform/IaC",
-    value=st.session_state.terraform_code,
-    height=420,
-)
-
-st.session_state.filename = st.text_input(
-    "Filename",
-    value=st.session_state.filename,
-)
-
-
-# ============================================================
-# VALIDATION BUTTON
-# ============================================================
-
-col1, col2, col3 = st.columns(3)
-
-with col1:
-    run_validation = st.button(
-        "🔎 Run Checkov",
-        use_container_width=True,
+    st.session_state.terraform_code = st.text_area(
+        "Terraform Code",
+        value=st.session_state.terraform_code,
+        height=450
     )
 
-with col2:
-    validate_cvs = st.button(
-        "🔐 Validate Through CVS",
-        use_container_width=True,
-    )
+    if st.button("Validate Terraform", type="primary"):
 
-with col3:
-    create_correction = st.button(
-        "🛠️ Suggest Correction",
-        use_container_width=True,
-    )
+        with st.spinner("Running Checkov and company policy validation..."):
 
-
-if run_validation:
-
-    with st.spinner("Running Checkov..."):
-
-        result = run_checkov(
-            st.session_state.terraform_code,
-            st.session_state.filename,
-        )
-
-    st.session_state.checkov_result = result
-
-    add_audit(
-        "Checkov validation",
-        f"Status: {result['status']}",
-    )
-
-    add_history(
-        f"Checkov validation: {result['status']}"
-    )
-
-
-if validate_cvs:
-
-    with st.spinner(
-        "CVS → Checkov validation → CVS commit..."
-    ):
-
-        result = cvs_validate_and_commit()
-
-    if result["ok"]:
-        st.success(
-            "Checkov validation passed and the "
-            "configuration was committed to CVS."
-        )
-    else:
-        st.error(
-            result["message"]
-        )
-
-    if result.get("checkov"):
-        st.session_state.checkov_result = (
-            result["checkov"]
-        )
-
-
-if create_correction:
-
-    findings = []
-
-    if st.session_state.checkov_result:
-        findings = st.session_state.checkov_result.get(
-            "findings",
-            [],
-        )
-
-    corrected = generate_correction(
-        st.session_state.terraform_code,
-    )
-
-    if corrected:
-
-        st.session_state.suggested_code = corrected
-
-        add_audit(
-            "Correction generated",
-            "Generated a restricted SSH example correction.",
-        )
-
-        st.success(
-            "A suggested correction was generated."
-        )
-
-    elif findings:
-
-        finding = next(
-            (
-                item
-                for item in findings
-                if item["status"] == "FAILED"
-            ),
-            findings[0],
-        )
-
-        st.session_state.ai_explanation = (
-            get_ai_explanation(finding)
-        )
-
-        st.info(
-            "An explanation was generated for the finding."
-        )
-
-    else:
-
-        st.info(
-            "Run Checkov first or use the unsafe demo."
-        )
-
-
-# ============================================================
-# CHECKOV RESULTS
-# ============================================================
-
-result = st.session_state.checkov_result
-
-if result:
-
-    st.subheader("📊 Checkov Results")
-
-    if result["status"] == "PASSED":
-
-        st.markdown(
-            '<div class="status-pass">'
-            '✅ Validation PASSED — no failed checks '
-            'were reported by Checkov.'
-            '</div>',
-            unsafe_allow_html=True,
-        )
-
-    elif result["status"] == "FAILED":
-
-        st.markdown(
-            '<div class="status-fail">'
-            '❌ Validation FAILED — security/policy '
-            'violations were detected.'
-            '</div>',
-            unsafe_allow_html=True,
-        )
-
-    else:
-
-        st.markdown(
-            '<div class="status-info">'
-            '⚠️ Validation could not be completed.'
-            '</div>',
-            unsafe_allow_html=True,
-        )
-
-    if result["status"] == "ERROR":
-
-        st.error(result["error"])
-
-    else:
-
-        m1, m2, m3 = st.columns(3)
-
-        m1.metric(
-            "Passed",
-            result["passed"],
-        )
-
-        m2.metric(
-            "Failed",
-            result["failed"],
-        )
-
-        m3.metric(
-            "Skipped",
-            result["skipped"],
-        )
-
-        findings = result["findings"]
-
-        if findings:
-
-            st.subheader("Security Findings")
-
-            table_rows = []
-
-            for item in findings:
-                table_rows.append(
-                    {
-                        "Status": item["status"],
-                        "Check ID": item["check_id"],
-                        "Check": item["check_name"],
-                        "Severity": item["severity"],
-                        "Resource": item["resource"],
-                    }
-                )
-
-            st.dataframe(
-                pd.DataFrame(table_rows),
-                use_container_width=True,
+            checkov_passed, checkov_output = run_checkov(
+                st.session_state.terraform_code
             )
 
-            failed = [
-                item
-                for item in findings
-                if item["status"] == "FAILED"
-            ]
+            policy_findings = check_company_policy(
+                st.session_state.terraform_code,
+                st.session_state.policy
+            )
 
-            if failed:
+            overall_passed = checkov_passed and not policy_findings
 
-                st.subheader(
-                    "❌ Failed Security Checks"
-                )
+            st.session_state.last_result = overall_passed
+            st.session_state.last_checkov_output = checkov_output
+            st.session_state.last_policy_findings = policy_findings
 
-                for index, finding in enumerate(
-                    failed,
-                    start=1,
-                ):
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-                    with st.expander(
-                        f"{index}. {finding['check_id']} — {finding['check_name']}"
-                    ):
+            st.session_state.validation_history.insert(
+                0,
+                {
+                    "time": timestamp,
+                    "result": "PASSED" if overall_passed else "FAILED",
+                    "checkov": "PASSED" if checkov_passed else "FAILED",
+                    "policy": "PASSED" if not policy_findings else "FAILED"
+                }
+            )
 
-                        st.write(
-                            f"**Resource:** {finding['resource']}"
-                        )
+            add_audit(
+                "Terraform validation completed: "
+                + ("PASSED" if overall_passed else "FAILED")
+            )
 
-                        st.write(
-                            f"**Severity:** {finding['severity']}"
-                        )
+    if st.session_state.last_result is not None:
 
-                        if finding["file_line_range"]:
-                            st.write(
-                                f"**Lines:** {finding['file_line_range']}"
-                            )
-
-                        if finding["guideline"]:
-                            st.write(
-                                f"**Guideline:** {finding['guideline']}"
-                            )
-
-                        if finding["code_block"]:
-                            st.code(
-                                "\n".join(
-                                    finding["code_block"]
-                                ),
-                                language="terraform",
-                            )
-
-                        if st.button(
-                            f"Explain {finding['check_id']}",
-                            key=f"explain_{index}",
-                        ):
-
-                            st.session_state.ai_explanation = (
-                                get_ai_explanation(
-                                    finding
-                                )
-                            )
-
-                            st.rerun()
-
-
-# ============================================================
-# AI EXPLANATION
-# ============================================================
-
-if st.session_state.ai_explanation:
-
-    st.subheader("🤖 AI Explanation")
-
-    st.markdown(
-        st.session_state.ai_explanation
-    )
-
-
-# ============================================================
-# SUGGESTED CORRECTION
-# ============================================================
-
-if st.session_state.suggested_code:
-
-    st.subheader("🛠️ Suggested Correction")
-
-    st.code(
-        st.session_state.suggested_code,
-        language="terraform",
-    )
-
-    if st.button(
-        "Use Suggested Correction",
-        use_container_width=True,
-    ):
-
-        st.session_state.previous_code = (
-            st.session_state.terraform_code
-        )
-
-        st.session_state.terraform_code = (
-            st.session_state.suggested_code
-        )
-
-        st.session_state.suggested_code = ""
-
-        add_audit(
-            "Correction applied",
-            "User applied suggested Terraform correction.",
-        )
-
-        st.success(
-            "Correction applied. Run validation again."
-        )
-
-        st.rerun()
-
-
-# ============================================================
-# CVS OPERATIONS
-# ============================================================
-
-st.divider()
-
-st.subheader("📦 CVS Version Control")
-
-c1, c2, c3 = st.columns(3)
-
-with c1:
-
-    if st.button(
-        "📥 CVS Checkout",
-        use_container_width=True,
-    ):
-
-        if not st.session_state.cvs_root:
-            st.error("Enter CVSROOT in the sidebar.")
-
-        elif not st.session_state.cvs_module:
-            st.error("Enter CVS Module in the sidebar.")
-
+        if st.session_state.last_result:
+            st.success("✅ VALIDATION PASSED")
         else:
+            st.error("❌ VALIDATION FAILED")
 
-            workspace = cvs_prepare_workspace()
+        result_col1, result_col2 = st.columns(2)
 
-            result = cvs_checkout(
-                st.session_state.cvs_module,
-                workspace,
+        with result_col1:
+            st.subheader("Checkov Result")
+
+            if "last_checkov_output" in st.session_state:
+                if st.session_state.last_checkov_output:
+                    st.code(
+                        st.session_state.last_checkov_output,
+                        language="text"
+                    )
+
+        with result_col2:
+            st.subheader("Company Policy Result")
+
+            if st.session_state.last_policy_findings:
+                for finding in st.session_state.last_policy_findings:
+                    st.error(finding)
+            else:
+                st.success("All configured company policies passed.")
+
+        st.subheader("AI Explanation")
+
+        explanations = explain_findings(
+            st.session_state.last_checkov_output,
+            st.session_state.last_policy_findings
+        )
+
+        for explanation in explanations:
+            st.info(explanation)
+
+        if st.session_state.last_policy_findings:
+
+            st.subheader("Suggested Correction")
+
+            corrected_code = suggest_correction(
+                st.session_state.terraform_code,
+                st.session_state.last_policy_findings
             )
 
-            if result["ok"]:
-                st.success("CVS checkout successful.")
-                st.session_state.cvs_output = (
-                    result["message"]
-                )
+            st.code(
+                corrected_code,
+                language="hcl"
+            )
+
+            if st.button("Use Suggested Correction"):
+
+                st.session_state.terraform_code = corrected_code
 
                 add_audit(
-                    "CVS checkout",
-                    st.session_state.cvs_module,
+                    "Suggested Terraform correction applied."
                 )
 
-            else:
-                st.error(result["message"])
+                st.rerun()
 
+with tabs[1]:
 
-with c2:
+    st.header("Company Policy Baseline")
 
-    if st.button(
-        "🔄 CVS Update",
-        use_container_width=True,
-    ):
+    policy_table = {
+        "Policy": [
+            "Block public SSH",
+            "Trusted SSH CIDR",
+            "Block public RDP",
+            "Require S3 public access block",
+            "Require storage encryption"
+        ],
+        "Value": [
+            str(st.session_state.policy["block_public_ssh"]),
+            st.session_state.policy["trusted_ssh_cidr"],
+            str(st.session_state.policy["block_public_rdp"]),
+            str(st.session_state.policy["require_s3_public_access_block"]),
+            str(st.session_state.policy["require_storage_encryption"])
+        ]
+    }
 
-        if not st.session_state.cvs_workspace:
+    st.table(policy_table)
+
+    st.write(
+        "The company security team defines the baseline policy. Developers validate their project-specific Terraform configuration against this baseline."
+    )
+
+with tabs[2]:
+
+    st.header("CVS Version Control")
+
+    if cvs_available():
+        st.success("CVS executable detected on this system.")
+    else:
+        st.warning(
+            "CVS executable is not available in this Streamlit environment. "
+            "CVS operations can be demonstrated when the application runs on a machine with CVS installed and a reachable CVS repository."
+        )
+
+    st.subheader("CVS Checkout")
+
+    if st.button("CVS Checkout"):
+        success, output = cvs_checkout(
+            cvs_repository,
+            cvs_module,
+            cvs_workspace
+        )
+
+        st.session_state.cvs_result = output
+
+        if success:
+            st.success("CVS checkout completed.")
+            add_audit("CVS checkout completed.")
+        else:
+            st.error("CVS checkout failed.")
+
+        st.code(output, language="text")
+
+    st.subheader("CVS Update")
+
+    if st.button("CVS Update"):
+        success, output = cvs_update(
+            cvs_repository,
+            cvs_workspace
+        )
+
+        st.session_state.cvs_result = output
+
+        if success:
+            st.success("CVS update completed.")
+            add_audit("CVS update completed.")
+        else:
+            st.error("CVS update failed.")
+
+        st.code(output, language="text")
+
+    st.subheader("CVS History")
+
+    if st.button("View CVS History"):
+        success, output = cvs_history(
+            cvs_repository,
+            cvs_module
+        )
+
+        st.session_state.cvs_result = output
+
+        if success:
+            st.success("CVS history retrieved.")
+            add_audit("CVS history viewed.")
+        else:
+            st.error("Unable to retrieve CVS history.")
+
+        st.code(output, language="text")
+
+    st.subheader("Security-Gated CVS Commit")
+
+    commit_message = st.text_input(
+        "Commit Message",
+        value="Validated Terraform configuration"
+    )
+
+    if st.button("Validate and CVS Commit"):
+
+        with st.spinner("Validating before CVS commit..."):
+
+            checkov_passed, checkov_output = run_checkov(
+                st.session_state.terraform_code
+            )
+
+            policy_findings = check_company_policy(
+                st.session_state.terraform_code,
+                st.session_state.policy
+            )
+
+            validation_passed = checkov_passed and not policy_findings
+
+        if not validation_passed:
+
             st.error(
-                "Create or specify a CVS workspace first."
+                "CVS COMMIT BLOCKED: Terraform validation failed."
+            )
+
+            if policy_findings:
+                for finding in policy_findings:
+                    st.error(finding)
+
+            st.code(checkov_output, language="text")
+
+            add_audit(
+                "CVS commit blocked because validation failed."
             )
 
         else:
 
-            result = cvs_update(
-                st.session_state.cvs_workspace
+            st.success(
+                "Terraform validation passed. CVS commit is allowed."
             )
 
-            if result["ok"]:
-                st.success("CVS update completed.")
-                st.session_state.cvs_output = (
-                    result["message"]
+            success, output = cvs_commit(
+                cvs_repository,
+                cvs_workspace,
+                commit_message
+            )
+
+            if success:
+                st.success("CVS commit completed successfully.")
+                add_audit(
+                    "CVS commit completed after successful validation."
                 )
-
             else:
-                st.error(result["message"])
+                st.error("CVS commit failed.")
+                st.code(output, language="text")
 
+with tabs[3]:
 
-with c3:
+    st.header("Validation History")
 
-    if st.button(
-        "📜 CVS History",
-        use_container_width=True,
-    ):
+    if not st.session_state.validation_history:
+        st.info("No validation history available yet.")
+    else:
+        st.table(st.session_state.validation_history)
 
-        if not st.session_state.cvs_workspace:
-            st.error(
-                "Create or specify a CVS workspace first."
-            )
+with tabs[4]:
 
-        else:
+    st.header("Audit Log")
 
-            result = cvs_log(
-                st.session_state.cvs_workspace,
-                st.session_state.filename,
-            )
-
-            if result["ok"]:
-                st.code(
-                    result["message"],
-                    language="text",
-                )
-
-            else:
-                st.error(result["message"])
-
-
-if st.session_state.cvs_output:
-
-    with st.expander(
-        "CVS Command Output",
-        expanded=False,
-    ):
-
-        st.code(
-            st.session_state.cvs_output,
-            language="text",
-        )
-
-
-# ============================================================
-# LOCAL AUDIT LOG
-# ============================================================
-
-st.divider()
-
-st.subheader("📝 Application Audit Log")
-
-if st.session_state.audit_log:
-
-    st.dataframe(
-        pd.DataFrame(
-            st.session_state.audit_log
-        ),
-        use_container_width=True,
-    )
-
-else:
-
-    st.info(
-        "No application actions recorded yet."
-    )
-
-
-# ============================================================
-# EXPORT RESULTS
-# ============================================================
-
-st.divider()
-
-st.subheader("📄 Export Results")
-
-if result and result.get("findings"):
-
-    rows = []
-
-    for finding in result["findings"]:
-
-        rows.append(
-            {
-                "Timestamp": datetime.now().strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                ),
-                "Filename": st.session_state.filename,
-                "Status": finding["status"],
-                "Check ID": finding["check_id"],
-                "Check Name": finding["check_name"],
-                "Severity": finding["severity"],
-                "Resource": finding["resource"],
-                "Guideline": finding["guideline"],
-            }
-        )
-
-    df = pd.DataFrame(rows)
-
-    csv_data = df.to_csv(
-        index=False
-    ).encode("utf-8")
-
-    st.download_button(
-        "⬇️ Download Validation Report",
-        data=csv_data,
-        file_name="iac_validation_report.csv",
-        mime="text/csv",
-    )
-
-
-# ============================================================
-# FOOTER
-# ============================================================
+    if not st.session_state.audit_log:
+        st.info("No audit events recorded yet.")
+    else:
+        st.table(st.session_state.audit_log)
 
 st.divider()
 
 st.caption(
-    "AI-IAC Validator | Terraform/IaC Security | "
-    "Checkov | CVS Version Control"
+    "AI-IAC Configuration Validator | Streamlit + Python + Terraform + Checkov + Company Policy + CVS"
 )
