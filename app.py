@@ -1,86 +1,38 @@
-import streamlit as st
-import subprocess
-import shutil
 import os
 import re
+import json
+import shutil
+import tempfile
+import subprocess
 from datetime import datetime
 
+import pandas as pd
+import streamlit as st
+
+
 st.set_page_config(
-    page_title="AI-IAC Configuration Validator",
-    page_icon="🔐",
+    page_title="AI-IAC Security Validation",
+    page_icon="🛡️",
     layout="wide"
 )
 
-if "policy" not in st.session_state:
-    st.session_state.policy = {
-        "block_public_ssh": True,
-        "trusted_ssh_cidr": "10.0.0.0/24",
-        "block_public_rdp": True,
-        "require_s3_public_access_block": True,
-        "require_storage_encryption": True
+
+SAFE_DEMO = """
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
     }
-
-if "validation_history" not in st.session_state:
-    st.session_state.validation_history = []
-
-if "audit_log" not in st.session_state:
-    st.session_state.audit_log = []
-
-if "terraform_code" not in st.session_state:
-    st.session_state.terraform_code = """resource "aws_security_group" "example" {
-  name = "example"
-
-  ingress {
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  ingress {
-    from_port   = 3389
-    to_port     = 3389
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
   }
 }
-"""
 
-if "last_result" not in st.session_state:
-    st.session_state.last_result = None
-
-if "last_checkov_output" not in st.session_state:
-    st.session_state.last_checkov_output = ""
-
-if "last_policy_findings" not in st.session_state:
-    st.session_state.last_policy_findings = []
-
-if "cvs_result" not in st.session_state:
-    st.session_state.cvs_result = ""
-
-UNSAFE_TERRAFORM = """resource "aws_security_group" "example" {
-  name = "example"
+resource "aws_security_group" "safe_demo" {
+  name        = "safe-demo"
+  description = "Security group with restricted SSH access"
 
   ingress {
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  ingress {
-    from_port   = 3389
-    to_port     = 3389
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-}
-"""
-
-SAFE_TERRAFORM = """resource "aws_security_group" "example" {
-  name = "example"
-
-  ingress {
+    description = "SSH from approved network"
     from_port   = 22
     to_port     = 22
     protocol    = "tcp"
@@ -88,633 +40,1858 @@ SAFE_TERRAFORM = """resource "aws_security_group" "example" {
   }
 
   egress {
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = ["10.0.0.0/24"]
+    description = "Outbound access"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
   }
 }
 """
 
-def add_audit(message):
+
+UNSAFE_DEMO = """
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+resource "aws_security_group" "unsafe_demo" {
+  name        = "unsafe-demo"
+  description = "Security group with public SSH access"
+
+  ingress {
+    description = "SSH from anywhere"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    description = "Outbound access"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+"""
+
+
+DEFAULT_POLICY = {
+    "name": "Company Security Policy",
+    "version": "1.0",
+    "rules": [
+        {
+            "id": "POLICY-SSH-001",
+            "name": "No Public SSH",
+            "description": "SSH must not be accessible from 0.0.0.0/0",
+            "severity": "HIGH",
+            "type": "forbidden_text",
+            "pattern": 'cidr_blocks = ["0.0.0.0/0"]'
+        },
+        {
+            "id": "POLICY-SSH-002",
+            "name": "SSH Port Must Be 22",
+            "description": "SSH ingress must use port 22",
+            "severity": "MEDIUM",
+            "type": "required_text",
+            "pattern": "to_port   = 22"
+        },
+        {
+            "id": "POLICY-DESC-001",
+            "name": "Security Group Needs Description",
+            "description": "Security groups must have a description",
+            "severity": "MEDIUM",
+            "type": "required_text",
+            "pattern": "description ="
+        }
+    ]
+}
+
+
+def current_time():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def initialize_state():
+    defaults = {
+        "terraform_code": SAFE_DEMO,
+        "filename": "safe_demo.tf",
+        "policy": json.loads(json.dumps(DEFAULT_POLICY)),
+        "policy_json": json.dumps(DEFAULT_POLICY, indent=2),
+        "last_result": None,
+        "validation_history": [],
+        "audit_log": [],
+        "selected_finding": None,
+        "suggested_code": "",
+        "cvs_output": ""
+    }
+
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+initialize_state()
+
+
+def add_audit(event, status="INFO", details=""):
     st.session_state.audit_log.insert(
         0,
         {
-            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "message": message
+            "Time": current_time(),
+            "Event": event,
+            "Status": status,
+            "Details": details
         }
     )
 
-def get_checkov_path():
-    return shutil.which("checkov")
+    st.session_state.audit_log = st.session_state.audit_log[:100]
 
-def run_checkov(terraform_code):
-    checkov_path = get_checkov_path()
 
-    if not checkov_path:
-        return False, "Checkov executable was not found. Install Checkov using the requirements.txt file."
+def add_validation_history(result):
+    st.session_state.validation_history.insert(
+        0,
+        {
+            "Time": current_time(),
+            "File": result["filename"],
+            "Passed": result["passed"],
+            "Failed": result["failed"],
+            "Skipped": result["skipped"],
+            "Total": result["total"],
+            "Result": result["overall"]
+        }
+    )
 
-    temp_file = "temporary_iac.tf"
+    st.session_state.validation_history = (
+        st.session_state.validation_history[:50]
+    )
 
+
+def get_executable(name):
+    return shutil.which(name)
+
+
+def run_command(command, cwd=None, env=None, timeout=180):
     try:
-        with open(temp_file, "w", encoding="utf-8") as file:
-            file.write(terraform_code)
-
         result = subprocess.run(
-            [
-                checkov_path,
-                "-f",
-                temp_file,
-                "--framework",
-                "terraform"
-            ],
+            command,
+            cwd=cwd,
+            env=env,
             capture_output=True,
             text=True,
-            timeout=120
+            timeout=timeout
         )
 
-        output = (result.stdout or "") + "\n" + (result.stderr or "")
+        output = (
+            (result.stdout or "")
+            + "\n"
+            + (result.stderr or "")
+        ).strip()
 
-        passed = result.returncode == 0
+        return result.returncode, output
 
-        return passed, output
+    except FileNotFoundError:
+        return 127, f"Command not found: {command[0]}"
 
-    except Exception as error:
-        return False, str(error)
+    except subprocess.TimeoutExpired:
+        return 124, "Command timed out."
 
-    finally:
-        if os.path.exists(temp_file):
-            os.remove(temp_file)
+    except Exception as exc:
+        return 1, str(exc)
 
-def check_company_policy(terraform_code, policy):
-    findings = []
 
-    if policy["block_public_ssh"]:
-        ssh_public_pattern = re.search(
-            r"from_port\s*=\s*22[\s\S]{0,500}?cidr_blocks\s*=\s*\[\s*\"0\.0\.0\.0/0\"",
-            terraform_code
-        )
+def extract_json(text):
+    decoder = json.JSONDecoder()
 
-        if ssh_public_pattern:
-            findings.append(
-                "SSH port 22 is publicly accessible from 0.0.0.0/0."
+    for match in re.finditer(r"[\{\[]", text):
+        try:
+            value, _ = decoder.raw_decode(
+                text[match.start():]
             )
 
-    if policy["block_public_rdp"]:
-        rdp_public_pattern = re.search(
-            r"from_port\s*=\s*3389[\s\S]{0,500}?cidr_blocks\s*=\s*\[\s*\"0\.0\.0\.0/0\"",
-            terraform_code
-        )
+            if isinstance(value, dict):
+                return value
 
-        if rdp_public_pattern:
-            findings.append(
-                "RDP port 3389 is publicly accessible from 0.0.0.0/0."
+        except Exception:
+            continue
+
+    return None
+
+
+def checkov_item(item, result_type):
+    return {
+        "id": item.get(
+            "check_id",
+            "UNKNOWN"
+        ),
+        "name": item.get(
+            "check_name",
+            item.get(
+                "check_id",
+                "Unknown Check"
             )
+        ),
+        "file": item.get(
+            "file_path",
+            ""
+        ),
+        "resource": item.get(
+            "resource",
+            ""
+        ),
+        "guideline": item.get(
+            "guideline",
+            ""
+        ),
+        "type": result_type
+    }
 
-    if policy["require_s3_public_access_block"]:
-        if "aws_s3_bucket_public_access_block" not in terraform_code:
-            if "aws_s3_bucket" in terraform_code:
-                findings.append(
-                    "S3 bucket public access block configuration is missing."
-                )
 
-    if policy["require_storage_encryption"]:
-        storage_detected = (
-            "aws_db_instance" in terraform_code
-            or "aws_ebs_volume" in terraform_code
-            or "aws_s3_bucket" in terraform_code
+def parse_checkov(data):
+    if not isinstance(data, dict):
+        return [], [], []
+
+    results = data.get(
+        "results",
+        {}
+    )
+
+    passed = [
+        checkov_item(
+            item,
+            "Checkov"
         )
-
-        encryption_detected = (
-            "encrypted = true" in terraform_code
-            or "server_side_encryption_configuration" in terraform_code
-            or "kms_key_id" in terraform_code
+        for item in (
+            results.get(
+                "passed_checks",
+                []
+            ) or []
         )
+    ]
 
-        if storage_detected and not encryption_detected:
-            findings.append(
-                "Storage encryption configuration is missing."
-            )
-
-    return findings
-
-def explain_findings(checkov_output, policy_findings):
-    explanations = []
-
-    if policy_findings:
-        for finding in policy_findings:
-            if "SSH port 22" in finding:
-                explanations.append(
-                    "SSH is exposed to the public internet. Restrict port 22 to the approved trusted network."
-                )
-            elif "RDP port 3389" in finding:
-                explanations.append(
-                    "RDP is exposed to the public internet. Restrict port 3389 to an approved internal network."
-                )
-            elif "S3 bucket public access" in finding:
-                explanations.append(
-                    "The S3 configuration does not contain the required public access block settings."
-                )
-            elif "Storage encryption" in finding:
-                explanations.append(
-                    "The storage resource should use encryption to protect stored data."
-                )
-
-    if not explanations and checkov_output:
-        if "FAILED" in checkov_output.upper():
-            explanations.append(
-                "Checkov identified one or more infrastructure security checks that require attention."
-            )
-
-    if not explanations:
-        explanations.append(
-            "No company-policy explanation is required because the current configuration passed the configured policy checks."
+    failed = [
+        checkov_item(
+            item,
+            "Checkov"
         )
-
-    return explanations
-
-def suggest_correction(terraform_code, policy_findings):
-    corrected_code = terraform_code
-
-    if any("SSH port 22" in finding for finding in policy_findings):
-        corrected_code = re.sub(
-            r'from_port\s*=\s*22([\s\S]{0,300}?)cidr_blocks\s*=\s*\[\s*"0\.0\.0\.0/0"\s*\]',
-            r'from_port = 22\1cidr_blocks = ["10.0.0.0/24"]',
-            corrected_code
+        for item in (
+            results.get(
+                "failed_checks",
+                []
+            ) or []
         )
+    ]
 
-    if any("RDP port 3389" in finding for finding in policy_findings):
-        corrected_code = re.sub(
-            r'\n\s*ingress\s*\{\s*from_port\s*=\s*3389[\s\S]*?\n\s*\}',
+    skipped = [
+        checkov_item(
+            item,
+            "Checkov"
+        )
+        for item in (
+            results.get(
+                "skipped_checks",
+                []
+            ) or []
+        )
+    ]
+
+    return passed, failed, skipped
+
+
+def run_checkov(code, filename):
+    checkov_path = get_executable("checkov")
+
+    if checkov_path:
+        command = [
+            checkov_path,
+            "-f",
             "",
-            corrected_code,
-            flags=re.MULTILINE
+            "--framework",
+            "terraform",
+            "-o",
+            "json"
+        ]
+    else:
+        command = [
+            "python",
+            "-m",
+            "checkov",
+            "-f",
+            "",
+            "--framework",
+            "terraform",
+            "-o",
+            "json"
+        ]
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+
+        safe_filename = os.path.basename(
+            filename or "main.tf"
         )
 
-    return corrected_code
+        if not safe_filename.endswith(".tf"):
+            safe_filename += ".tf"
 
-def cvs_available():
-    return shutil.which("cvs") is not None
-
-def run_cvs_command(arguments, workspace=None):
-    cvs_path = shutil.which("cvs")
-
-    if not cvs_path:
-        return False, "CVS executable was not found on this system."
-
-    try:
-        result = subprocess.run(
-            [cvs_path] + arguments,
-            cwd=workspace if workspace else None,
-            capture_output=True,
-            text=True,
-            timeout=120
+        file_path = os.path.join(
+            temp_dir,
+            safe_filename
         )
 
-        output = (result.stdout or "") + "\n" + (result.stderr or "")
+        with open(
+            file_path,
+            "w",
+            encoding="utf-8"
+        ) as file:
+            file.write(code)
 
-        return result.returncode == 0, output
+        command[2] = file_path
 
-    except Exception as error:
-        return False, str(error)
+        return_code, output = run_command(
+            command,
+            cwd=temp_dir,
+            timeout=180
+        )
 
-def cvs_checkout(repository, module, workspace):
-    os.makedirs(workspace, exist_ok=True)
+        data = extract_json(output)
 
-    return run_cvs_command(
-        [
-            "-d",
-            repository,
-            "checkout",
-            module
-        ],
-        workspace
+        if data is None:
+            return {
+                "available": return_code != 127,
+                "return_code": return_code,
+                "passed": [],
+                "failed": [],
+                "skipped": [],
+                "error": (
+                    "Checkov did not return readable JSON."
+                ),
+                "raw_output": output
+            }
+
+        passed, failed, skipped = parse_checkov(
+            data
+        )
+
+        return {
+            "available": True,
+            "return_code": return_code,
+            "passed": passed,
+            "failed": failed,
+            "skipped": skipped,
+            "error": "",
+            "raw_output": output
+        }
+
+
+def run_company_policy(code, policy):
+    passed = []
+    failed = []
+
+    rules = policy.get(
+        "rules",
+        []
     )
 
-def cvs_update(repository, workspace):
-    return run_cvs_command(
-        [
-            "-d",
-            repository,
-            "update",
-            "-dP"
-        ],
-        workspace
+    for rule in rules:
+
+        rule_id = rule.get(
+            "id",
+            "POLICY-UNKNOWN"
+        )
+
+        name = rule.get(
+            "name",
+            rule_id
+        )
+
+        description = rule.get(
+            "description",
+            ""
+        )
+
+        severity = rule.get(
+            "severity",
+            "MEDIUM"
+        )
+
+        rule_type = rule.get(
+            "type",
+            "forbidden_text"
+        )
+
+        pattern = rule.get(
+            "pattern",
+            ""
+        )
+
+        base = {
+            "id": rule_id,
+            "name": name,
+            "description": description,
+            "severity": severity,
+            "type": "Company Policy"
+        }
+
+        if not pattern:
+            failed.append({
+                **base,
+                "reason": "Policy pattern is empty."
+            })
+            continue
+
+        if rule_type == "forbidden_text":
+
+            if pattern in code:
+                failed.append({
+                    **base,
+                    "reason": (
+                        f"Forbidden text found: {pattern}"
+                    )
+                })
+            else:
+                passed.append(base)
+
+        elif rule_type == "required_text":
+
+            if pattern in code:
+                passed.append(base)
+            else:
+                failed.append({
+                    **base,
+                    "reason": (
+                        f"Required text not found: {pattern}"
+                    )
+                })
+
+        elif rule_type == "regex":
+
+            try:
+                matched = (
+                    re.search(
+                        pattern,
+                        code,
+                        re.MULTILINE
+                    )
+                    is not None
+                )
+
+                regex_error = ""
+
+            except re.error as exc:
+                matched = False
+                regex_error = str(exc)
+
+            if matched:
+                passed.append(base)
+
+            else:
+                if regex_error:
+                    reason = (
+                        f"Invalid regex: {regex_error}"
+                    )
+                else:
+                    reason = (
+                        f"Regex condition failed: {pattern}"
+                    )
+
+                failed.append({
+                    **base,
+                    "reason": reason
+                })
+
+        else:
+            failed.append({
+                **base,
+                "reason": (
+                    f"Unsupported rule type: {rule_type}"
+                )
+            })
+
+    return passed, failed
+
+
+def validate_code():
+    code = st.session_state.terraform_code
+
+    filename = (
+        st.session_state.filename
+        or "main.tf"
     )
 
-def cvs_history(repository, module):
-    return run_cvs_command(
+    if not filename.endswith(".tf"):
+        filename += ".tf"
+
+    company_passed, company_failed = (
+        run_company_policy(
+            code,
+            st.session_state.policy
+        )
+    )
+
+    checkov = run_checkov(
+        code,
+        filename
+    )
+
+    passed = (
+        company_passed
+        + checkov["passed"]
+    )
+
+    failed = (
+        company_failed
+        + checkov["failed"]
+    )
+
+    skipped = checkov["skipped"]
+
+    total = (
+        len(passed)
+        + len(failed)
+        + len(skipped)
+    )
+
+    overall = (
+        "PASS"
+        if len(failed) == 0
+        else "FAIL"
+    )
+
+    result = {
+        "time": current_time(),
+        "filename": filename,
+        "passed": len(passed),
+        "failed": len(failed),
+        "skipped": len(skipped),
+        "total": total,
+        "overall": overall,
+        "passed_checks": passed,
+        "failed_checks": failed,
+        "skipped_checks": skipped,
+        "checkov": checkov
+    }
+
+    st.session_state.last_result = result
+
+    add_validation_history(
+        result
+    )
+
+    add_audit(
+        "Validation completed",
+        overall,
+        (
+            f"Passed={len(passed)}, "
+            f"Failed={len(failed)}, "
+            f"Skipped={len(skipped)}"
+        )
+    )
+
+    return result
+
+
+def load_demo(demo):
+    if demo == "safe":
+        st.session_state.terraform_code = SAFE_DEMO
+        st.session_state.filename = "safe_demo.tf"
+    else:
+        st.session_state.terraform_code = UNSAFE_DEMO
+        st.session_state.filename = "unsafe_demo.tf"
+
+    st.session_state.last_result = None
+    st.session_state.suggested_code = ""
+
+    add_audit(
+        "Demo loaded",
+        "INFO",
+        demo
+    )
+
+
+def explain_finding(finding):
+    if not finding:
+        return ""
+
+    if finding.get("type") == "Company Policy":
+        return (
+            f"Policy: {finding.get('name', '')}\n\n"
+            f"Description: "
+            f"{finding.get('description', '')}\n\n"
+            f"Reason: "
+            f"{finding.get('reason', '')}"
+        )
+
+    return (
+        f"Checkov check: "
+        f"{finding.get('name', '')}\n\n"
+        f"Check ID: "
+        f"{finding.get('id', '')}\n\n"
+        f"Resource: "
+        f"{finding.get('resource', '')}\n\n"
+        f"Guideline: "
+        f"{finding.get('guideline', '')}"
+    )
+
+
+def generate_correction(code):
+    return code.replace(
+        'cidr_blocks = ["0.0.0.0/0"]',
+        'cidr_blocks = ["10.0.0.0/24"]',
+        1
+    )
+
+
+def show_validation_results(result):
+    if not result:
+        st.info(
+            "No validation result yet. "
+            "Click REVALIDATE CODE."
+        )
+        return
+
+    st.subheader(
+        "Validation Summary"
+    )
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    col1.metric(
+        "PASSED",
+        result["passed"]
+    )
+
+    col2.metric(
+        "FAILED",
+        result["failed"]
+    )
+
+    col3.metric(
+        "SKIPPED",
+        result["skipped"]
+    )
+
+    col4.metric(
+        "TOTAL",
+        result["total"]
+    )
+
+    st.write("")
+
+    if result["overall"] == "PASS":
+        st.success(
+            "✓ ALL CHECKS PASSED"
+        )
+    else:
+        st.error(
+            "✗ VALIDATION FAILED"
+        )
+
+    st.write(
+        f"File: `{result['filename']}`"
+    )
+
+    st.write(
+        f"Validation time: `{result['time']}`"
+    )
+
+    passed_tab, failed_tab, skipped_tab = st.tabs(
         [
-            "-d",
-            repository,
-            "log",
-            module
+            f"✓ Passed ({result['passed']})",
+            f"✗ Failed ({result['failed']})",
+            f"⊘ Skipped ({result['skipped']})"
         ]
     )
 
-def cvs_commit(repository, workspace, message):
-    return run_cvs_command(
-        [
-            "-d",
-            repository,
-            "commit",
-            "-m",
-            message
-        ],
-        workspace
+    with passed_tab:
+
+        if result["passed_checks"]:
+
+            passed_rows = []
+
+            for item in result["passed_checks"]:
+                passed_rows.append(
+                    {
+                        "ID": item.get(
+                            "id",
+                            ""
+                        ),
+                        "Check": item.get(
+                            "name",
+                            ""
+                        ),
+                        "Type": item.get(
+                            "type",
+                            ""
+                        ),
+                        "Severity": item.get(
+                            "severity",
+                            ""
+                        )
+                    }
+                )
+
+            st.dataframe(
+                pd.DataFrame(
+                    passed_rows
+                ),
+                use_container_width=True,
+                hide_index=True
+            )
+
+        else:
+            st.info(
+                "No checks passed."
+            )
+
+    with failed_tab:
+
+        if result["failed_checks"]:
+
+            failed_rows = []
+
+            for item in result["failed_checks"]:
+                failed_rows.append(
+                    {
+                        "ID": item.get(
+                            "id",
+                            ""
+                        ),
+                        "Check": item.get(
+                            "name",
+                            ""
+                        ),
+                        "Severity": item.get(
+                            "severity",
+                            ""
+                        ),
+                        "Type": item.get(
+                            "type",
+                            ""
+                        ),
+                        "Reason": item.get(
+                            "reason",
+                            item.get(
+                                "guideline",
+                                ""
+                            )
+                        )
+                    }
+                )
+
+            st.dataframe(
+                pd.DataFrame(
+                    failed_rows
+                ),
+                use_container_width=True,
+                hide_index=True
+            )
+
+            st.subheader(
+                "Failed Check Details"
+            )
+
+            options = []
+
+            for index, item in enumerate(
+                result["failed_checks"]
+            ):
+                options.append(
+                    f"{item.get('id', '')} - "
+                    f"{item.get('name', '')}"
+                )
+
+            selected = st.selectbox(
+                "Select failed check",
+                range(len(options)),
+                format_func=lambda x: options[x]
+            )
+
+            finding = result[
+                "failed_checks"
+            ][selected]
+
+            st.warning(
+                explain_finding(
+                    finding
+                )
+            )
+
+            if st.button(
+                "Generate Correction"
+            ):
+                st.session_state.suggested_code = (
+                    generate_correction(
+                        st.session_state.terraform_code
+                    )
+                )
+
+            if st.session_state.suggested_code:
+
+                st.subheader(
+                    "Suggested Corrected Terraform"
+                )
+
+                st.code(
+                    st.session_state.suggested_code,
+                    language="hcl"
+                )
+
+                if st.button(
+                    "Use Suggested Correction"
+                ):
+                    st.session_state.terraform_code = (
+                        st.session_state.suggested_code
+                    )
+
+                    st.session_state.last_result = None
+
+                    st.success(
+                        "Correction applied. "
+                        "Click REVALIDATE CODE."
+                    )
+
+                    st.rerun()
+
+        else:
+            st.success(
+                "✓ No failed checks."
+            )
+
+    with skipped_tab:
+
+        if result["skipped_checks"]:
+
+            skipped_rows = []
+
+            for item in result["skipped_checks"]:
+                skipped_rows.append(
+                    {
+                        "ID": item.get(
+                            "id",
+                            ""
+                        ),
+                        "Check": item.get(
+                            "name",
+                            ""
+                        ),
+                        "Type": item.get(
+                            "type",
+                            ""
+                        )
+                    }
+                )
+
+            st.dataframe(
+                pd.DataFrame(
+                    skipped_rows
+                ),
+                use_container_width=True,
+                hide_index=True
+            )
+
+        else:
+            st.info(
+                "No skipped checks."
+            )
+
+    if result["checkov"].get("error"):
+        st.warning(
+            result["checkov"]["error"]
+        )
+
+
+def policy_section():
+    st.header(
+        "1. Company Security Policy"
     )
 
-st.title("🔐 AI-IAC Configuration Validator")
-st.write(
-    "Validate Terraform Infrastructure as Code against company security policies and Checkov before CVS commit."
-)
+    policy = st.session_state.policy
 
-st.sidebar.header("Company Security Policy")
+    col1, col2 = st.columns(
+        [3, 1]
+    )
 
-block_public_ssh = st.sidebar.checkbox(
-    "Block public SSH",
-    value=st.session_state.policy["block_public_ssh"]
-)
+    with col1:
+        policy_name = st.text_input(
+            "Policy Name",
+            value=policy.get(
+                "name",
+                "Company Security Policy"
+            )
+        )
 
-trusted_ssh_cidr = st.sidebar.text_input(
-    "Trusted SSH CIDR",
-    value=st.session_state.policy["trusted_ssh_cidr"]
-)
+    with col2:
+        policy_version = st.text_input(
+            "Version",
+            value=policy.get(
+                "version",
+                "1.0"
+            )
+        )
 
-block_public_rdp = st.sidebar.checkbox(
-    "Block public RDP",
-    value=st.session_state.policy["block_public_rdp"]
-)
+    st.write(
+        "Current Policy Rules"
+    )
 
-require_s3_public_access_block = st.sidebar.checkbox(
-    "Require S3 public access block",
-    value=st.session_state.policy["require_s3_public_access_block"]
-)
+    rules = policy.get(
+        "rules",
+        []
+    )
 
-require_storage_encryption = st.sidebar.checkbox(
-    "Require storage encryption",
-    value=st.session_state.policy["require_storage_encryption"]
-)
+    if rules:
 
-if st.sidebar.button("Save Policy Baseline"):
-    st.session_state.policy = {
-        "block_public_ssh": block_public_ssh,
-        "trusted_ssh_cidr": trusted_ssh_cidr,
-        "block_public_rdp": block_public_rdp,
-        "require_s3_public_access_block": require_s3_public_access_block,
-        "require_storage_encryption": require_storage_encryption
-    }
+        rows = []
 
-    add_audit("Company security policy baseline updated.")
-    st.sidebar.success("Policy baseline saved.")
+        for rule in rules:
+            rows.append(
+                {
+                    "ID": rule.get(
+                        "id",
+                        ""
+                    ),
+                    "Name": rule.get(
+                        "name",
+                        ""
+                    ),
+                    "Severity": rule.get(
+                        "severity",
+                        ""
+                    ),
+                    "Type": rule.get(
+                        "type",
+                        ""
+                    ),
+                    "Pattern": rule.get(
+                        "pattern",
+                        ""
+                    )
+                }
+            )
 
-st.sidebar.subheader("Active Policy")
+        st.dataframe(
+            pd.DataFrame(rows),
+            use_container_width=True,
+            hide_index=True
+        )
 
-st.sidebar.write(
-    {
-        "Public SSH blocked": st.session_state.policy["block_public_ssh"],
-        "Trusted SSH network": st.session_state.policy["trusted_ssh_cidr"],
-        "Public RDP blocked": st.session_state.policy["block_public_rdp"],
-        "S3 public access block": st.session_state.policy["require_s3_public_access_block"],
-        "Storage encryption": st.session_state.policy["require_storage_encryption"]
-    }
-)
+    with st.expander(
+        "Edit Complete Policy"
+    ):
 
-st.sidebar.subheader("CVS Configuration")
+        policy_json = st.text_area(
+            "Policy JSON",
+            value=st.session_state.policy_json,
+            height=300
+        )
 
-cvs_repository = st.sidebar.text_input(
-    "CVS Repository",
-    value="C:/cvsrepo"
-)
+        if st.button(
+            "Save Policy"
+        ):
 
-cvs_module = st.sidebar.text_input(
-    "CVS Module",
-    value="iac-project"
-)
+            try:
 
-cvs_workspace = st.sidebar.text_input(
-    "CVS Workspace",
-    value="C:/cvsworkspace"
-)
+                new_policy = json.loads(
+                    policy_json
+                )
 
-tabs = st.tabs(
-    [
-        "Terraform Validation",
-        "Policy",
-        "CVS",
-        "Validation History",
-        "Audit Log"
-    ]
-)
+                if not isinstance(
+                    new_policy,
+                    dict
+                ):
+                    raise ValueError(
+                        "Policy must be a JSON object."
+                    )
 
-with tabs[0]:
+                if "rules" not in new_policy:
+                    raise ValueError(
+                        "Policy must contain rules."
+                    )
 
-    st.header("Terraform Infrastructure Code")
+                new_policy["name"] = (
+                    policy_name
+                )
+
+                new_policy["version"] = (
+                    policy_version
+                )
+
+                st.session_state.policy = (
+                    new_policy
+                )
+
+                st.session_state.policy_json = (
+                    json.dumps(
+                        new_policy,
+                        indent=2
+                    )
+                )
+
+                st.session_state.last_result = None
+
+                add_audit(
+                    "Security policy updated",
+                    "INFO"
+                )
+
+                st.success(
+                    "Policy updated successfully. "
+                    "Click REVALIDATE CODE."
+                )
+
+            except Exception as exc:
+
+                st.error(
+                    f"Invalid policy JSON: {exc}"
+                )
+
+    with st.expander(
+        "Add New Policy Rule"
+    ):
+
+        with st.form(
+            "new_policy_rule"
+        ):
+
+            rule_id = st.text_input(
+                "Rule ID",
+                value="POLICY-NEW-001"
+            )
+
+            rule_name = st.text_input(
+                "Rule Name"
+            )
+
+            description = st.text_area(
+                "Description"
+            )
+
+            severity = st.selectbox(
+                "Severity",
+                [
+                    "LOW",
+                    "MEDIUM",
+                    "HIGH",
+                    "CRITICAL"
+                ]
+            )
+
+            rule_type = st.selectbox(
+                "Rule Type",
+                [
+                    "forbidden_text",
+                    "required_text",
+                    "regex"
+                ]
+            )
+
+            pattern = st.text_input(
+                "Pattern"
+            )
+
+            submitted = st.form_submit_button(
+                "Add Policy Rule"
+            )
+
+            if submitted:
+
+                if not rule_name:
+                    st.error(
+                        "Rule name is required."
+                    )
+
+                elif not pattern:
+                    st.error(
+                        "Pattern is required."
+                    )
+
+                else:
+
+                    new_rule = {
+                        "id": rule_id,
+                        "name": rule_name,
+                        "description": description,
+                        "severity": severity,
+                        "type": rule_type,
+                        "pattern": pattern
+                    }
+
+                    st.session_state.policy[
+                        "name"
+                    ] = policy_name
+
+                    st.session_state.policy[
+                        "version"
+                    ] = policy_version
+
+                    st.session_state.policy[
+                        "rules"
+                    ].append(
+                        new_rule
+                    )
+
+                    st.session_state.policy_json = (
+                        json.dumps(
+                            st.session_state.policy,
+                            indent=2
+                        )
+                    )
+
+                    st.session_state.last_result = None
+
+                    add_audit(
+                        "Policy rule added",
+                        "INFO",
+                        rule_id
+                    )
+
+                    st.success(
+                        "Policy rule added. "
+                        "Click REVALIDATE CODE."
+                    )
+
+                    st.rerun()
+
+
+def terraform_section():
+    st.header(
+        "2. Terraform Code"
+    )
 
     col1, col2 = st.columns(2)
 
     with col1:
-        if st.button("Load Unsafe Demo"):
-            st.session_state.terraform_code = UNSAFE_TERRAFORM
-            add_audit("Unsafe Terraform demonstration loaded.")
+
+        if st.button(
+            "SAFE DEMO",
+            use_container_width=True
+        ):
+            load_demo("safe")
+            st.rerun()
 
     with col2:
-        if st.button("Load Safe Demo"):
-            st.session_state.terraform_code = SAFE_TERRAFORM
-            add_audit("Safe Terraform demonstration loaded.")
+
+        if st.button(
+            "UNSAFE DEMO",
+            use_container_width=True
+        ):
+            load_demo("unsafe")
+            st.rerun()
 
     uploaded_file = st.file_uploader(
-        "Upload Terraform file",
+        "Add your Terraform .tf file",
         type=["tf"]
     )
 
     if uploaded_file:
-        st.session_state.terraform_code = uploaded_file.read().decode(
-            "utf-8",
-            errors="replace"
-        )
 
-        add_audit(
-            "Terraform file uploaded: " + uploaded_file.name
-        )
+        try:
 
-    st.session_state.terraform_code = st.text_area(
+            uploaded_code = (
+                uploaded_file
+                .getvalue()
+                .decode("utf-8")
+            )
+
+            st.session_state.filename = (
+                uploaded_file.name
+            )
+
+            st.session_state.terraform_code = (
+                uploaded_code
+            )
+
+            st.session_state.last_result = None
+
+            add_audit(
+                "Terraform file uploaded",
+                "INFO",
+                uploaded_file.name
+            )
+
+        except Exception as exc:
+
+            st.error(
+                f"Could not read file: {exc}"
+            )
+
+    filename = st.text_input(
+        "Terraform filename",
+        value=st.session_state.filename
+    )
+
+    st.session_state.filename = filename
+
+    code = st.text_area(
         "Terraform Code",
         value=st.session_state.terraform_code,
         height=450
     )
 
-    if st.button("Validate Terraform", type="primary"):
+    st.session_state.terraform_code = code
 
-        with st.spinner("Running Checkov and company policy validation..."):
+    st.write("")
 
-            checkov_passed, checkov_output = run_checkov(
-                st.session_state.terraform_code
+    if st.button(
+        "🔄 REVALIDATE CODE",
+        type="primary",
+        use_container_width=True
+    ):
+
+        with st.spinner(
+            "Running company policy validation and Checkov..."
+        ):
+
+            result = validate_code()
+
+        if result["overall"] == "PASS":
+
+            st.success(
+                "Validation completed successfully."
             )
 
-            policy_findings = check_company_policy(
-                st.session_state.terraform_code,
-                st.session_state.policy
-            )
-
-            overall_passed = checkov_passed and not policy_findings
-
-            st.session_state.last_result = overall_passed
-            st.session_state.last_checkov_output = checkov_output
-            st.session_state.last_policy_findings = policy_findings
-
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-            st.session_state.validation_history.insert(
-                0,
-                {
-                    "time": timestamp,
-                    "result": "PASSED" if overall_passed else "FAILED",
-                    "checkov": "PASSED" if checkov_passed else "FAILED",
-                    "policy": "PASSED" if not policy_findings else "FAILED"
-                }
-            )
-
-            add_audit(
-                "Terraform validation completed: "
-                + ("PASSED" if overall_passed else "FAILED")
-            )
-
-    if st.session_state.last_result is not None:
-
-        if st.session_state.last_result:
-            st.success("✅ VALIDATION PASSED")
         else:
-            st.error("❌ VALIDATION FAILED")
 
-        result_col1, result_col2 = st.columns(2)
+            st.error(
+                "Validation completed with failed checks."
+            )
 
-        with result_col1:
-            st.subheader("Checkov Result")
+        st.rerun()
 
-            if "last_checkov_output" in st.session_state:
-                if st.session_state.last_checkov_output:
-                    st.code(
-                        st.session_state.last_checkov_output,
-                        language="text"
-                    )
+    if st.session_state.last_result:
 
-        with result_col2:
-            st.subheader("Company Policy Result")
-
-            if st.session_state.last_policy_findings:
-                for finding in st.session_state.last_policy_findings:
-                    st.error(finding)
-            else:
-                st.success("All configured company policies passed.")
-
-        st.subheader("AI Explanation")
-
-        explanations = explain_findings(
-            st.session_state.last_checkov_output,
-            st.session_state.last_policy_findings
+        report = json.dumps(
+            st.session_state.last_result,
+            indent=2,
+            default=str
         )
 
-        for explanation in explanations:
-            st.info(explanation)
+        st.download_button(
+            "Download Validation Report",
+            data=report,
+            file_name="iac_validation_report.json",
+            mime="application/json",
+            use_container_width=True
+        )
 
-        if st.session_state.last_policy_findings:
 
-            st.subheader("Suggested Correction")
+def cvs_environment(cvs_root):
+    env = os.environ.copy()
 
-            corrected_code = suggest_correction(
-                st.session_state.terraform_code,
-                st.session_state.last_policy_findings
+    if cvs_root:
+        env["CVSROOT"] = cvs_root
+
+    return env
+
+
+def cvs_available():
+    cvs = get_executable(
+        "cvs"
+    )
+
+    if not cvs:
+        return False, (
+            "CVS executable was not found. "
+            "Add cvs to packages.txt and redeploy."
+        )
+
+    rc, output = run_command(
+        [
+            cvs,
+            "--version"
+        ]
+    )
+
+    return rc == 0, output
+
+
+def cvs_checkout(
+    cvs_root,
+    module,
+    workspace
+):
+    cvs = get_executable(
+        "cvs"
+    )
+
+    if not cvs:
+        return 127, (
+            "CVS executable was not found."
+        )
+
+    os.makedirs(
+        workspace,
+        exist_ok=True
+    )
+
+    command = [
+        cvs
+    ]
+
+    if cvs_root:
+        command.extend(
+            [
+                "-d",
+                cvs_root
+            ]
+        )
+
+    command.extend(
+        [
+            "checkout",
+            module
+        ]
+    )
+
+    return run_command(
+        command,
+        cwd=workspace,
+        env=cvs_environment(
+            cvs_root
+        )
+    )
+
+
+def cvs_update(
+    cvs_root,
+    workspace
+):
+    cvs = get_executable(
+        "cvs"
+    )
+
+    if not cvs:
+        return 127, (
+            "CVS executable was not found."
+        )
+
+    return run_command(
+        [
+            cvs,
+            "update",
+            "-dP"
+        ],
+        cwd=workspace,
+        env=cvs_environment(
+            cvs_root
+        )
+    )
+
+
+def cvs_add(
+    cvs_root,
+    workspace,
+    filename
+):
+    cvs = get_executable(
+        "cvs"
+    )
+
+    if not cvs:
+        return 127, (
+            "CVS executable was not found."
+        )
+
+    return run_command(
+        [
+            cvs,
+            "add",
+            filename
+        ],
+        cwd=workspace,
+        env=cvs_environment(
+            cvs_root
+        )
+    )
+
+
+def cvs_diff(
+    cvs_root,
+    workspace,
+    filename
+):
+    cvs = get_executable(
+        "cvs"
+    )
+
+    if not cvs:
+        return 127, (
+            "CVS executable was not found."
+        )
+
+    return run_command(
+        [
+            cvs,
+            "diff",
+            "-u",
+            filename
+        ],
+        cwd=workspace,
+        env=cvs_environment(
+            cvs_root
+        )
+    )
+
+
+def cvs_commit(
+    cvs_root,
+    workspace,
+    filename,
+    message
+):
+    cvs = get_executable(
+        "cvs"
+    )
+
+    if not cvs:
+        return 127, (
+            "CVS executable was not found."
+        )
+
+    return run_command(
+        [
+            cvs,
+            "commit",
+            "-m",
+            message,
+            filename
+        ],
+        cwd=workspace,
+        env=cvs_environment(
+            cvs_root
+        )
+    )
+
+
+def cvs_log(
+    cvs_root,
+    workspace,
+    filename
+):
+    cvs = get_executable(
+        "cvs"
+    )
+
+    if not cvs:
+        return 127, (
+            "CVS executable was not found."
+        )
+
+    return run_command(
+        [
+            cvs,
+            "log",
+            filename
+        ],
+        cwd=workspace,
+        env=cvs_environment(
+            cvs_root
+        )
+    )
+
+
+def cvs_save_workspace(
+    workspace
+):
+    os.makedirs(
+        workspace,
+        exist_ok=True
+    )
+
+    filename = st.session_state.filename
+
+    if not filename.endswith(".tf"):
+        filename += ".tf"
+
+    path = os.path.join(
+        workspace,
+        filename
+    )
+
+    with open(
+        path,
+        "w",
+        encoding="utf-8"
+    ) as file:
+        file.write(
+            st.session_state.terraform_code
+        )
+
+    return path
+
+
+def cvs_section():
+    st.header(
+        "3. CVS Version Control"
+    )
+
+    available, status = cvs_available()
+
+    if available:
+        st.success(
+            "✓ CVS is installed."
+        )
+    else:
+        st.warning(
+            status
+        )
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+
+        cvs_root = st.text_input(
+            "CVSROOT",
+            value=os.environ.get(
+                "CVSROOT",
+                ""
             )
+        )
 
-            st.code(
-                corrected_code,
-                language="hcl"
+        cvs_module = st.text_input(
+            "CVS Module"
+        )
+
+    with col2:
+
+        default_workspace = os.path.join(
+            tempfile.gettempdir(),
+            "ai_iac_cvs"
+        )
+
+        workspace = st.text_input(
+            "CVS Workspace",
+            value=default_workspace
+        )
+
+        commit_message = st.text_input(
+            "Commit Message",
+            value=(
+                "AI-IAC validated Terraform change"
             )
+        )
 
-            if st.button("Use Suggested Correction"):
+    col1, col2, col3 = st.columns(3)
 
-                st.session_state.terraform_code = corrected_code
+    with col1:
+
+        if st.button(
+            "CVS CHECKOUT",
+            use_container_width=True
+        ):
+
+            if not cvs_module:
+
+                st.error(
+                    "Enter a CVS Module."
+                )
+
+            else:
+
+                rc, output = cvs_checkout(
+                    cvs_root,
+                    cvs_module,
+                    workspace
+                )
+
+                st.session_state.cvs_output = (
+                    output
+                )
 
                 add_audit(
-                    "Suggested Terraform correction applied."
+                    "CVS checkout",
+                    "PASS" if rc == 0 else "FAIL",
+                    output[-500:]
                 )
 
                 st.rerun()
 
-with tabs[1]:
+    with col2:
 
-    st.header("Company Policy Baseline")
+        if st.button(
+            "CVS UPDATE",
+            use_container_width=True
+        ):
 
-    policy_table = {
-        "Policy": [
-            "Block public SSH",
-            "Trusted SSH CIDR",
-            "Block public RDP",
-            "Require S3 public access block",
-            "Require storage encryption"
-        ],
-        "Value": [
-            str(st.session_state.policy["block_public_ssh"]),
-            st.session_state.policy["trusted_ssh_cidr"],
-            str(st.session_state.policy["block_public_rdp"]),
-            str(st.session_state.policy["require_s3_public_access_block"]),
-            str(st.session_state.policy["require_storage_encryption"])
-        ]
-    }
-
-    st.table(policy_table)
-
-    st.write(
-        "The company security team defines the baseline policy. Developers validate their project-specific Terraform configuration against this baseline."
-    )
-
-with tabs[2]:
-
-    st.header("CVS Version Control")
-
-    if cvs_available():
-        st.success("CVS executable detected on this system.")
-    else:
-        st.warning(
-            "CVS executable is not available in this Streamlit environment. "
-            "CVS operations can be demonstrated when the application runs on a machine with CVS installed and a reachable CVS repository."
-        )
-
-    st.subheader("CVS Checkout")
-
-    if st.button("CVS Checkout"):
-        success, output = cvs_checkout(
-            cvs_repository,
-            cvs_module,
-            cvs_workspace
-        )
-
-        st.session_state.cvs_result = output
-
-        if success:
-            st.success("CVS checkout completed.")
-            add_audit("CVS checkout completed.")
-        else:
-            st.error("CVS checkout failed.")
-
-        st.code(output, language="text")
-
-    st.subheader("CVS Update")
-
-    if st.button("CVS Update"):
-        success, output = cvs_update(
-            cvs_repository,
-            cvs_workspace
-        )
-
-        st.session_state.cvs_result = output
-
-        if success:
-            st.success("CVS update completed.")
-            add_audit("CVS update completed.")
-        else:
-            st.error("CVS update failed.")
-
-        st.code(output, language="text")
-
-    st.subheader("CVS History")
-
-    if st.button("View CVS History"):
-        success, output = cvs_history(
-            cvs_repository,
-            cvs_module
-        )
-
-        st.session_state.cvs_result = output
-
-        if success:
-            st.success("CVS history retrieved.")
-            add_audit("CVS history viewed.")
-        else:
-            st.error("Unable to retrieve CVS history.")
-
-        st.code(output, language="text")
-
-    st.subheader("Security-Gated CVS Commit")
-
-    commit_message = st.text_input(
-        "Commit Message",
-        value="Validated Terraform configuration"
-    )
-
-    if st.button("Validate and CVS Commit"):
-
-        with st.spinner("Validating before CVS commit..."):
-
-            checkov_passed, checkov_output = run_checkov(
-                st.session_state.terraform_code
+            rc, output = cvs_update(
+                cvs_root,
+                workspace
             )
 
-            policy_findings = check_company_policy(
-                st.session_state.terraform_code,
-                st.session_state.policy
+            st.session_state.cvs_output = (
+                output
             )
-
-            validation_passed = checkov_passed and not policy_findings
-
-        if not validation_passed:
-
-            st.error(
-                "CVS COMMIT BLOCKED: Terraform validation failed."
-            )
-
-            if policy_findings:
-                for finding in policy_findings:
-                    st.error(finding)
-
-            st.code(checkov_output, language="text")
 
             add_audit(
-                "CVS commit blocked because validation failed."
+                "CVS update",
+                "PASS" if rc == 0 else "FAIL",
+                output[-500:]
+            )
+
+            st.rerun()
+
+    with col3:
+
+        if st.button(
+            "CVS DIFF",
+            use_container_width=True
+        ):
+
+            rc, output = cvs_diff(
+                cvs_root,
+                workspace,
+                st.session_state.filename
+            )
+
+            st.session_state.cvs_output = (
+                output
+            )
+
+            add_audit(
+                "CVS diff",
+                "PASS" if rc == 0 else "FAIL",
+                output[-500:]
+            )
+
+            st.rerun()
+
+    st.divider()
+
+    if st.button(
+        "🔐 VALIDATE + CVS COMMIT",
+        type="primary",
+        use_container_width=True
+    ):
+
+        result = (
+            st.session_state.last_result
+        )
+
+        if result is None:
+
+            result = validate_code()
+
+        if result["failed"] > 0:
+
+            st.error(
+                "CVS COMMIT BLOCKED"
+            )
+
+            st.write(
+                f"Passed: {result['passed']}"
+            )
+
+            st.write(
+                f"Failed: {result['failed']}"
+            )
+
+            st.write(
+                f"Skipped: {result['skipped']}"
+            )
+
+            st.write(
+                "Fix the failed validation checks "
+                "and click REVALIDATE CODE before committing."
+            )
+
+            add_audit(
+                "CVS commit blocked",
+                "FAIL",
+                "Security validation failed."
             )
 
         else:
 
-            st.success(
-                "Terraform validation passed. CVS commit is allowed."
-            )
+            if not available:
 
-            success, output = cvs_commit(
-                cvs_repository,
-                cvs_workspace,
-                commit_message
-            )
-
-            if success:
-                st.success("CVS commit completed successfully.")
-                add_audit(
-                    "CVS commit completed after successful validation."
+                st.error(
+                    "CVS is not installed."
                 )
+
             else:
-                st.error("CVS commit failed.")
-                st.code(output, language="text")
 
-with tabs[3]:
+                cvs_save_workspace(
+                    workspace
+                )
 
-    st.header("Validation History")
+                update_rc, update_output = (
+                    cvs_update(
+                        cvs_root,
+                        workspace
+                    )
+                )
 
-    if not st.session_state.validation_history:
-        st.info("No validation history available yet.")
+                add_rc, add_output = cvs_add(
+                    cvs_root,
+                    workspace,
+                    st.session_state.filename
+                )
+
+                diff_rc, diff_output = cvs_diff(
+                    cvs_root,
+                    workspace,
+                    st.session_state.filename
+                )
+
+                commit_rc, commit_output = (
+                    cvs_commit(
+                        cvs_root,
+                        workspace,
+                        st.session_state.filename,
+                        commit_message
+                    )
+                )
+
+                st.session_state.cvs_output = (
+                    "CVS UPDATE\n"
+                    + update_output
+                    + "\n\nCVS ADD\n"
+                    + add_output
+                    + "\n\nCVS DIFF\n"
+                    + diff_output
+                    + "\n\nCVS COMMIT\n"
+                    + commit_output
+                )
+
+                if commit_rc == 0:
+
+                    st.success(
+                        "✓ Validation passed "
+                        "and CVS commit completed."
+                    )
+
+                    add_audit(
+                        "CVS commit",
+                        "PASS",
+                        commit_message
+                    )
+
+                else:
+
+                    st.error(
+                        "Validation passed, "
+                        "but CVS commit failed."
+                    )
+
+                    add_audit(
+                        "CVS commit",
+                        "FAIL",
+                        commit_output[-500:]
+                    )
+
+    if st.button(
+        "CVS LOG",
+        use_container_width=True
+    ):
+
+        rc, output = cvs_log(
+            cvs_root,
+            workspace,
+            st.session_state.filename
+        )
+
+        st.session_state.cvs_output = (
+            output
+        )
+
+        st.rerun()
+
+    if st.session_state.cvs_output:
+
+        st.subheader(
+            "CVS Output"
+        )
+
+        st.text_area(
+            "CVS command output",
+            value=st.session_state.cvs_output,
+            height=250,
+            disabled=True
+        )
+
+
+def history_section():
+    st.header(
+        "4. Validation History"
+    )
+
+    if st.session_state.validation_history:
+
+        st.dataframe(
+            pd.DataFrame(
+                st.session_state.validation_history
+            ),
+            use_container_width=True,
+            hide_index=True
+        )
+
     else:
-        st.table(st.session_state.validation_history)
 
-with tabs[4]:
+        st.info(
+            "No validation history yet."
+        )
 
-    st.header("Audit Log")
+    st.header(
+        "5. Audit Log"
+    )
 
-    if not st.session_state.audit_log:
-        st.info("No audit events recorded yet.")
+    if st.session_state.audit_log:
+
+        st.dataframe(
+            pd.DataFrame(
+                st.session_state.audit_log
+            ),
+            use_container_width=True,
+            hide_index=True
+        )
+
     else:
-        st.table(st.session_state.audit_log)
+
+        st.info(
+            "No audit events yet."
+        )
+
+
+st.title(
+    "🛡️ AI-IAC Security Configuration Validation"
+)
+
+st.caption(
+    "Company Policy + Checkov + Terraform + CVS"
+)
+
+policy_section()
 
 st.divider()
 
-st.caption(
-    "AI-IAC Configuration Validator | Streamlit + Python + Terraform + Checkov + Company Policy + CVS"
-)
+terraform_section()
+
+st.divider()
+
+if st.session_state.last_result:
+
+    show_validation_results(
+        st.session_state.last_result
+    )
+
+else:
+
+    st.info(
+        "Select Safe Demo, Unsafe Demo, "
+        "or upload a Terraform file, "
+        "then click REVALIDATE CODE."
+    )
+
+st.divider()
+
+cvs_section()
+
+st.divider()
+
+history_section()
